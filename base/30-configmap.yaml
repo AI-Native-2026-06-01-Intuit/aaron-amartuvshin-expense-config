@@ -1,0 +1,16 @@
+# base/30-configmap.yaml — non-secret env. SPRING_PROFILES_ACTIVE stays `smoke`
+# so the pod boots standalone-healthy (no Postgres/Redis/Kafka in these namespaces);
+# overlays vary LOGGING_LEVEL_ROOT per env. namespace is set by the overlay.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: expense-api-config
+  labels:
+    app.kubernetes.io/name: expense-api
+    app.kubernetes.io/part-of: expense
+data:
+  SPRING_PROFILES_ACTIVE: smoke
+  LOGGING_LEVEL_ROOT: INFO
+  SERVER_PORT: "8080"
+  OTEL_SDK_DISABLED: "true"
+  OTEL_SERVICE_NAME: expense-api

@@ -1,0 +1,68 @@
+# base/10-deployment.yaml — the workload (W5 D3, verbatim minus the hardcoded
+# namespace). Image tag 0.1.0 is imported into the k3d cluster; the overlays'
+# `images:` rewrite is what the CI bump-config PR advances. imagePullPolicy
+# IfNotPresent so k3d serves the imported image without a registry round-trip.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: expense-api
+  labels:
+    app.kubernetes.io/name: expense-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: expense
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: expense-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: expense-api
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: expense
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+        - name: expense-api
+          image: uptimecrew/expense-api:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8080 }
+          envFrom:
+            - configMapRef: { name: expense-api-config }
+            - secretRef: { name: expense-api-secrets }
+          env:
+            # Fast-start flags (TieredStopAtLevel=1 + SerialGC) cut JVM boot CPU so
+            # several replicas across dev/staging/prod can start on a small k3d
+            # cluster without starving each other; MaxRAMPercentage sizes the heap
+            # from the cgroup limit.
+            - name: JAVA_TOOL_OPTIONS
+              value: "-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError -XX:TieredStopAtLevel=1 -XX:+UseSerialGC"
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { memory: 1Gi }
+          startupProbe:
+            httpGet: { path: /actuator/health/liveness, port: http }
+            periodSeconds: 5
+            failureThreshold: 60          # 60 x 5s = 300s cold-start budget (small cluster under CPU contention)
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: http }
+            periodSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+            timeoutSeconds: 3

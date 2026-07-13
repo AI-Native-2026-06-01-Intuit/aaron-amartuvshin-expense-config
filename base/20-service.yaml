@@ -1,0 +1,18 @@
+# base/20-service.yaml — stable ClusterIP. namespace is set by the overlay.
+apiVersion: v1
+kind: Service
+metadata:
+  name: expense-api
+  labels:
+    app.kubernetes.io/name: expense-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: expense
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: expense-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
