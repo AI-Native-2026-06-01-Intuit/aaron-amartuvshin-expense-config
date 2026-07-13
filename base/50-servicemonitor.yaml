@@ -1,0 +1,18 @@
+# base/50-servicemonitor.yaml — Prometheus scrape (monitoring.coreos.com CRD,
+# whitelisted in the AppProject). Kept from W5 D5; namespace set by the overlay.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: expense-api
+  labels:
+    release: kube-prometheus-stack
+    app.kubernetes.io/name: expense-api
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: expense-api
+  endpoints:
+    - port: http
+      path: /actuator/prometheus
+      interval: 15s
+      scrapeTimeout: 10s

@@ -1,0 +1,41 @@
+# argocd/applications/expense-api-dev.yaml — the dev anchor Application.
+# Task 3's ApplicationSet generates the matching staging + prod (and re-generates
+# this dev one), but this file stays as the one concrete Application to read.
+# spec.project is `expense` — never "default". The finalizer ensures deleting the
+# Application also prunes the Deployment/Service/ConfigMap it created.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: expense-api-dev
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    env: dev
+    team: expense
+spec:
+  project: expense                        # <- the project, never "default"
+  source:
+    repoURL: https://github.com/AI-Native-2026-06-01-Intuit/aaron-amartuvshin-expense-config.git
+    path: overlays/dev
+    targetRevision: main
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: expense-dev
+  syncPolicy:
+    automated:
+      prune: true                         # remove resources deleted from Git
+      selfHeal: true                      # revert drift from a live kubectl edit
+      allowEmpty: false                   # never sync an empty manifest set
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true              # avoids the 256 kB last-applied-config limit
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

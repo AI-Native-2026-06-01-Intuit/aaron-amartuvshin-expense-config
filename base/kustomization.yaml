@@ -1,0 +1,13 @@
+# base/kustomization.yaml — the W5 D3 manifest set, env-agnostic. NO Namespace
+# resource: Namespace is cluster-scoped and the AppProject sets
+# clusterResourceWhitelist: [] (full deny), so Argo CD owns namespace creation via
+# the Application's CreateNamespace=true syncOption instead of syncing a cluster
+# resource. Overlays add namespace + replicas + image tag + per-env ConfigMap values.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - 10-deployment.yaml
+  - 20-service.yaml
+  - 30-configmap.yaml
+  - 40-secret.yaml
+  - 50-servicemonitor.yaml

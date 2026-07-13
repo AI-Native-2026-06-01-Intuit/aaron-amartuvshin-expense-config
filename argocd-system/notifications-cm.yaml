@@ -1,0 +1,52 @@
+# argocd-system/notifications-cm.yaml — wires argocd-notifications-controller to
+# Slack. The credential provided is a Slack INCOMING WEBHOOK, so we use Argo CD's
+# `service.webhook` (the bot-token `service.slack` model needs an xoxb app token we
+# don't have). The URL lives in the argocd-notifications-secret (key
+# slack-webhook-url), created out-of-band — NEVER committed. Alert on BAD outcomes
+# only; on-sync-succeeded is deliberately omitted (a firehose people mute).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+  namespace: argocd
+data:
+  # Slack incoming webhook; URL resolved from the Secret.
+  service.webhook.expense-slack: |
+    url: $slack-webhook-url
+    headers:
+      - name: Content-Type
+        value: application/json
+
+  trigger.on-sync-failed: |
+    - description: Application sync failed.
+      send: [app-sync-failed]
+      when: app.status.operationState.phase in ['Error', 'Failed']
+
+  trigger.on-health-degraded: |
+    - description: Application health degraded.
+      send: [app-health-degraded]
+      when: app.status.health.status == 'Degraded'
+
+  template.app-sync-failed: |
+    webhook:
+      expense-slack:
+        method: POST
+        body: |
+          {"text": ":x: *{{.app.metadata.name}}* sync FAILED — project {{.app.spec.project}}, phase {{.app.status.operationState.phase}}. {{.app.status.operationState.message}}"}
+
+  template.app-health-degraded: |
+    webhook:
+      expense-slack:
+        method: POST
+        body: |
+          {"text": ":warning: *{{.app.metadata.name}}* health DEGRADED — project {{.app.spec.project}}. {{.app.status.health.message}}"}
+
+  # Default subscription: every Application labelled team=expense routes both
+  # bad-outcome triggers to the expense-deploys Slack channel (via the webhook).
+  # Recipient is the webhook service INSTANCE name (`expense-slack`), NOT
+  # `webhook:expense-slack` — for a `service.webhook.<name>` entry this engine
+  # registers the service under <name>, so recipients reference it by that name.
+  subscriptions: |
+    - recipients: [expense-slack]
+      triggers: [on-sync-failed, on-health-degraded]
+      selector: team=expense
