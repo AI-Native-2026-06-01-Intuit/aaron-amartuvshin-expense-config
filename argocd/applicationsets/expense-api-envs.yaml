@@ -1,0 +1,64 @@
+# argocd/applicationsets/expense-api-envs.yaml — one Application per env from a
+# matrix generator (env list × clusters selector). Adding a new env is a one-line
+# list entry. preserveResourcesOnDeletion keeps a workload alive if its env falls
+# out of the matrix (a human re-reviews before any teardown).
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: expense-api-envs
+  namespace: argocd
+spec:
+  syncPolicy:
+    preserveResourcesOnDeletion: true
+  generators:
+    - matrix:
+        generators:
+          # A: the explicit env list.
+          - list:
+              elements:
+                - { env: dev,     overlay: overlays/dev,     namespace: expense-dev,     wave: "0" }
+                - { env: staging, overlay: overlays/staging, namespace: expense-staging, wave: "1" }
+                - { env: prod,    overlay: overlays/prod,    namespace: expense-prod,    wave: "2" }
+          # B: every cluster labelled tier=workload. The local in-cluster is
+          # registered as a labelled Secret at install time (see the bring-up).
+          - clusters:
+              selector:
+                matchLabels:
+                  uptimecrew.example.internal/tier: workload
+  template:
+    metadata:
+      name: expense-api-{{env}}
+      namespace: argocd
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+      annotations:
+        # Cross-env promotion order: dev(0) → staging(1) → prod(2). (Within a
+        # single Application, the Namespace's own sync-wave -1 lands it first.)
+        argocd.argoproj.io/sync-wave: "{{wave}}"
+      labels:
+        env: "{{env}}"
+        team: expense
+    spec:
+      project: expense
+      source:
+        repoURL: https://github.com/AI-Native-2026-06-01-Intuit/aaron-amartuvshin-expense-config.git
+        path: "{{overlay}}"
+        targetRevision: main
+      destination:
+        server: "{{server}}"
+        namespace: "{{namespace}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+          - PrunePropagationPolicy=foreground
+          - PruneLast=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 3m

@@ -1,0 +1,81 @@
+# argocd/projects/expense.yaml — AppProject scoping the expense capstone team.
+# Every Application here sets spec.project: expense — never "default". Narrow
+# allow-lists: a compromised config repo can't smuggle in a privileged DaemonSet.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: expense
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: expense-api capstone — GitOps overlays + observability
+
+  # WHICH repos may an Application use as source? Exactly one; no "*".
+  sourceRepos:
+    - https://github.com/AI-Native-2026-06-01-Intuit/aaron-amartuvshin-expense-config.git
+
+  # WHICH (cluster, namespace) pairs are legal? Three explicit pairs; no globs.
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: expense-dev
+    - server: https://kubernetes.default.svc
+      namespace: expense-staging
+    - server: https://kubernetes.default.svc
+      namespace: expense-prod
+
+  # Cluster-scoped resources: full deny (empty). Platform team owns ClusterRoles,
+  # CRDs, PersistentVolumes, etc.
+  clusterResourceWhitelist: []
+
+  # Namespace-scoped resources: only the kinds our manifests use.
+  namespaceResourceWhitelist:
+    - { group: "", kind: Namespace }
+    - { group: "", kind: Service }
+    - { group: "", kind: ConfigMap }
+    - { group: "", kind: Secret }
+    - { group: "", kind: ServiceAccount }
+    - { group: apps, kind: Deployment }
+    - { group: autoscaling, kind: HorizontalPodAutoscaler }
+    - { group: policy, kind: PodDisruptionBudget }
+    - { group: networking.k8s.io, kind: NetworkPolicy }
+    - { group: monitoring.coreos.com, kind: ServiceMonitor }
+    - { group: monitoring.coreos.com, kind: PrometheusRule }
+
+  # Quota knobs are platform-owned — explicitly denied.
+  namespaceResourceBlacklist:
+    - { group: "", kind: ResourceQuota }
+    - { group: "", kind: LimitRange }
+
+  # Weekend change-freeze on prod: no auto-sync Fri 17:00 → Mon 05:00 UTC.
+  # A human can still force-sync (manualSync: true).
+  syncWindows:
+    - kind: deny
+      schedule: "0 17 * * 5"
+      duration: 60h
+      applications:
+        - expense-api-prod
+      manualSync: true
+
+  # Project-scoped RBAC — two roles, not "everyone is admin". Group bindings are
+  # inert until OIDC is wired (W6 D3); they document intent for the platform team.
+  roles:
+    - name: developers
+      description: Read everything; sync dev + staging only; never delete.
+      policies:
+        - p, proj:expense:developers, applications, get, expense/*, allow
+        - p, proj:expense:developers, applications, sync, expense/expense-api-dev, allow
+        - p, proj:expense:developers, applications, sync, expense/expense-api-staging, allow
+        - p, proj:expense:developers, applications, delete, expense/*, deny
+        - p, proj:expense:developers, logs, get, expense/*, allow
+      groups:
+        - uptimecrew:expense-engineers
+    - name: releasers
+      description: Full sync including prod. Cannot delete Applications.
+      policies:
+        - p, proj:expense:releasers, applications, get, expense/*, allow
+        - p, proj:expense:releasers, applications, sync, expense/*, allow
+        - p, proj:expense:releasers, applications, action/*, expense/*, allow
+        - p, proj:expense:releasers, applications, delete, expense/*, deny
+      groups:
+        - uptimecrew:expense-engineers-releasers
