@@ -1,0 +1,23 @@
+# overlays/staging/kustomization.yaml — staging overlay over base/.
+# Adaptations vs the reference: image tag is 0.1.0 (imported into k3d, so pods are
+# Healthy), and SPRING_PROFILES_ACTIVE stays 'smoke' (the app's only standalone-
+# healthy profile — a bare 'dev/staging/prod' Spring profile would try to reach
+# Postgres and CrashLoop). Per-env knob varied here: LOGGING_LEVEL_ROOT.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+namespace: expense-staging
+images:
+  - name: uptimecrew/expense-api
+    newName: uptimecrew/expense-api
+    newTag: 0.1.0
+replicas:
+  - name: expense-api
+    count: 2
+patches:
+  - target: { kind: ConfigMap, name: expense-api-config }
+    patch: |-
+      - op: replace
+        path: /data/LOGGING_LEVEL_ROOT
+        value: INFO
