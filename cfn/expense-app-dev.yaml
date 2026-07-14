@@ -6,17 +6,18 @@
 #
 # DB master credentials: the password is NEVER a Parameter (NoEcho or not -- a
 # NoEcho Parameter still lands in the template's parameter history and in
-# `describe-stacks` tooling paths). The secret is created ONCE per env out-of-band
-#   aws secretsmanager create-secret --name expense/dev/db-master-aaron ...
-# and resolved at deploy time via the {{resolve:secretsmanager:...}} dynamic
-# reference below. CFN never sees the plaintext; it substitutes it directly into
-# the RDS API call. (This is the Task 3 curriculum-correct pattern; the reference
-# scaffold's in-stack AWS::SecretsManager::Secret + SecretTargetAttachment is the
-# alternative rotation-friendly shape, dropped here to keep the out-of-band secret
-# authoritative and the stack teardown clean -- see expense-api/INFRA.md.)
+# `describe-stacks` tooling paths). CFN generates + owns the secret in-stack via
+# AWS::SecretsManager::Secret + GenerateSecretString, the RDS instance resolves it
+# with the {{resolve:secretsmanager:...}} dynamic reference (CFN substitutes the
+# plaintext straight into the RDS API call -- it never lands in template state),
+# and a SecretTargetAttachment binds the secret to the live DB so rotation can
+# target it. (Review note W6D3: the scaffold's in-stack-secret shape is the
+# preferred one -- an earlier revision used a hand-created out-of-band secret;
+# switched to this on ES feedback.)
 #
-# Stateful resources carry BOTH DeletionPolicy: Retain AND UpdateReplacePolicy:
-# Retain so neither a stack delete nor a property-change replacement destroys data.
+# Stateful resources (the secret AND the DB) carry BOTH DeletionPolicy: Retain AND
+# UpdateReplacePolicy: Retain so neither a stack delete nor a property-change
+# replacement destroys data.
 AWSTemplateFormatVersion: "2010-09-09"
 Description: expense application stack -- RDS (cross-stack imports + SM dynamic ref) (aaron).
 
@@ -33,7 +34,7 @@ Parameters:
   SecretName:
     Type: String
     Default: expense/dev/db-master-aaron
-    Description: Out-of-band Secrets Manager secret holding username/password.
+    Description: Name for the CFN-managed DB master secret (username/password).
   DbInstanceClass:
     Type: String
     Default: db.t4g.small
@@ -41,6 +42,33 @@ Parameters:
     Description: RDS instance class (dev keeps the smallest burstable class).
 
 Resources:
+  # --- CFN-managed DB master secret. GenerateSecretString builds the password at
+  # create time (CFN never sees a plaintext input); Retain on BOTH policies so a
+  # stack delete / replacement can't destroy the live credentials.
+  DbMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W77
+            reason: >-
+              Encrypted with the default aws/secretsmanager KMS key — a dedicated CMK
+              is out of scope for this dev secret; staging/prod would set KmsKeyId.
+    Properties:
+      Name:        !Ref SecretName
+      Description: !Sub "expense ${EnvName} RDS master credentials (aaron)."
+      GenerateSecretString:
+        # username is fixed in the template; only the password is generated.
+        SecretStringTemplate: '{"username": "expense_master"}'
+        GenerateStringKey:    password
+        PasswordLength:       32
+        ExcludeCharacters:    '"@/\'
+      Tags:
+        - {Key: Env,     Value: !Ref EnvName}
+        - {Key: Project, Value: expense}
+
   # --- DB subnet group spanning the private subnets imported from the network
   # stack. !Split + !ImportValue is the cross-stack pattern; the import resolves
   # to concrete subnet IDs at deploy time (visible in describe-change-set).
@@ -103,6 +131,9 @@ Resources:
     Type: AWS::RDS::DBInstance
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
+    # Dynamic references do NOT create a dependency, so pin creation order
+    # explicitly: the secret must exist before the RDS resolves the password.
+    DependsOn: DbMasterSecret
     Metadata:
       cfn_nag:
         rules_to_suppress:
@@ -128,9 +159,6 @@ Resources:
       PubliclyAccessible:    false
       MultiAZ:               false
       BackupRetentionPeriod: 7
-      # DeletionProtection intentionally FALSE in dev so this training stack tears
-      # down cleanly (the DeletionPolicy: Retain above still guards accidental data
-      # loss on a stack delete). staging/prod would flip this true -- see INFRA.md.
       DeletionProtection:    false
       MasterUsername:
         "Fn::Sub": "{{resolve:secretsmanager:${SecretName}:SecretString:username}}"
@@ -140,10 +168,22 @@ Resources:
         - {Key: Env,     Value: !Ref EnvName}
         - {Key: Project, Value: expense}
 
+  # --- Bind the secret to the live DB so Secrets Manager rotation can target the
+  # instance ARN and the secret records its host/port/dbname connection details.
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId:   !Ref DbMasterSecret
+      TargetId:   !Ref DbInstance
+      TargetType: AWS::RDS::DBInstance
+
 Outputs:
   DbEndpoint:
     Value: !GetAtt DbInstance.Endpoint.Address
     Export: {Name: !Sub "${AWS::StackName}-DbEndpoint"}
+  DbSecretArn:
+    Value: !Ref DbMasterSecret
+    Export: {Name: !Sub "${AWS::StackName}-DbSecretArn"}
   DbSecurityGroupId:
     Value: !Ref DbSecurityGroup
     Export: {Name: !Sub "${AWS::StackName}-DbSgId"}
