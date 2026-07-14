@@ -1,0 +1,207 @@
+# cfn/expense-bootstrap-dev.yaml
+# TASK 1 baseline stack: the first CloudFormation stack the team deploys for this
+# capstone. Creates a minimal S3 bucket (artefact storage for templates uploaded
+# with `aws cloudformation package`) plus the IAM role GitHub Actions (W6 D1 OIDC)
+# assumes to deploy ALL FUTURE CFN stacks. The role's policy enumerates Action
+# explicitly; Resource is scoped to the stack ARN pattern -- never Action: '*' /
+# Resource: '*'.
+#
+# SHARED-ACCOUNT NOTE: account 726695008378 is shared across team67. The canonical
+# unsuffixed names (expense-bootstrap-dev, role expense-api-cfn-deploy, bucket
+# uptimecrew-expense-bootstrap-dev-<acct>) are already taken by a teammate, so every
+# named resource here carries the `-aaron` trainee suffix (same convention as the
+# W6 D1 role expense-api-build-push-aaron). See expense-api/INFRA.md.
+#
+# Deploy with the ChangeSet flow:
+#   aws cloudformation create-change-set \
+#     --stack-name expense-bootstrap-dev-aaron \
+#     --change-set-name initial --change-set-type CREATE \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --template-body file://cfn/expense-bootstrap-dev.yaml \
+#     --parameters ParameterKey=EnvName,ParameterValue=dev \
+#     --region us-east-1
+#   aws cloudformation describe-change-set ...   # review the resource diff
+#   aws cloudformation execute-change-set ...
+AWSTemplateFormatVersion: "2010-09-09"
+Description: expense bootstrap stack -- artefact bucket starter + CFN deploy role (aaron).
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment.
+  RetentionDays:
+    # Parameterised value: dev keeps 30d of noncurrent versions; prod keeps 365.
+    Type: Number
+    Default: 30
+    MinValue: 7
+    MaxValue: 3650
+    Description: NoncurrentVersionExpiration in days (lifecycle rule).
+  GitHubOrg:
+    Type: String
+    Default: AI-Native-2026-06-01-Intuit
+    Description: GitHub org that hosts the gitops config repo (OIDC sub claim).
+  GitHubRepo:
+    Type: String
+    Default: aaron-amartuvshin-expense-config
+    Description: Repo (the W6 D2 gitops config repo) the OIDC sub claim pins to.
+
+Resources:
+  # --- The bootstrap bucket. Hardened from day 1: PAB on all four toggles,
+  # default KMS encryption (aws/s3 SSE-KMS), versioning on, lifecycle rule.
+  # DeletionPolicy + UpdateReplacePolicy both Retain so a stack delete / a
+  # property-change replacement never destroys this bucket.
+  BootstrapBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: >-
+              Access logging intentionally omitted for this dev bootstrap bucket;
+              a dedicated log-delivery bucket is out of scope for the training env.
+    Properties:
+      # Synthetic globally-unique name; -aaron disambiguates within the shared
+      # team67 account, AWS::AccountId across cohorts/accounts.
+      BucketName: !Sub "uptimecrew-expense-bootstrap-${EnvName}-aaron-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: alias/aws/s3
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        # All four toggles. Anything less is wrong for an internal bucket.
+        BlockPublicAcls:       true
+        BlockPublicPolicy:     true
+        IgnorePublicAcls:      true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref RetentionDays
+      Tags:
+        - {Key: Env,     Value: !Ref EnvName}
+        - {Key: Project, Value: expense}
+
+  # --- Bucket policy: deny any request not using TLS.
+  BootstrapBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BootstrapBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonTLS
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt BootstrapBucket.Arn
+              - !Sub "${BootstrapBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # --- The CFN-deploy IAM role for GitHub Actions to assume via OIDC.
+  # Trust policy: web-identity federation; StringEquals on the aud claim,
+  # StringLike on the sub claim pinned to the gitops repo's main branch + PR
+  # workflow. NEVER a wildcard sub claim.
+  CfnDeployRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit RoleName is required so the W6 D1 GitHub Actions workflow can
+              hard-reference a stable role ARN; the -aaron suffix already prevents a
+              shared-account name collision.
+          - id: F38
+            reason: >-
+              iam:PassRole is scoped to the arn:aws:iam::<acct>:role/expense-* prefix
+              (the roles these stacks themselves create), not Resource '*'; a prefix
+              is the least-privilege shape for a CFN deploy role.
+    Properties:
+      RoleName: expense-api-cfn-deploy-aaron
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+              # StringLike (not StringEquals): branch + PR refs differ per workflow
+              # run; the org/repo prefix is exact.
+              StringLike:
+                "token.actions.githubusercontent.com:sub":
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main"
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:pull_request"
+      Policies:
+        - PolicyName: cfn-deploy-narrow
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CFN itself: only THIS capstone's stacks (expense-* prefix).
+              - Sid: CfnStackOps
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:DetectStackDrift
+                  - cloudformation:DescribeStackDriftDetectionStatus
+                  - cloudformation:DescribeStackResourceDrifts
+                Resource:
+                  - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/expense-*"
+                  - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/expense-*"
+              # S3 read on the bootstrap bucket (for stored templates).
+              - Sid: BootstrapBucketRead
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt BootstrapBucket.Arn
+                  - !Sub "${BootstrapBucket.Arn}/*"
+              # IAM: only PassRole to roles the stacks themselves create.
+              - Sid: PassStackRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/expense-*"
+      Tags:
+        - {Key: Env,     Value: !Ref EnvName}
+        - {Key: Project, Value: expense}
+
+Outputs:
+  BootstrapBucketName:
+    Description: Globally-unique bootstrap bucket name.
+    Value: !Ref BootstrapBucket
+    Export: {Name: !Sub "${AWS::StackName}-BucketName"}
+  BootstrapBucketArn:
+    Value: !GetAtt BootstrapBucket.Arn
+    Export: {Name: !Sub "${AWS::StackName}-BucketArn"}
+  CfnDeployRoleArn:
+    Description: ARN the W6 D1 GitHub Actions workflow assumes via OIDC.
+    Value: !GetAtt CfnDeployRole.Arn
+    Export: {Name: !Sub "${AWS::StackName}-CfnDeployRoleArn"}
