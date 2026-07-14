@@ -1,38 +1,43 @@
 # cfn/expense-cost-dev.yaml
-# W6 D4 cost stack: extends the W6 D3 substrate with the managed-AI
-# dependency (a least-privilege Bedrock invoke role), the SNS fan-out
-# topic for cost alarms, a per-request CloudWatch alarm, a monthly AWS
-# Budget + a 100%-actual BudgetsAction that attaches an explicit-deny
-# policy to the invoke role, and a hardened S3 bucket for Cost & Usage
-# Report rows.
+# W6 D4 cost stack: the LLM cost-monitoring substrate — an SNS fan-out topic for
+# cost alarms, a per-request CloudWatch alarm keyed on the EMF metric the proxy
+# emits, a monthly AWS Budget with forecasted-80% + actual-100% SNS notifications,
+# and a hardened S3 bucket for Cost & Usage Report rows.
 #
-# The Bedrock role trusts the SHARED, platform-provided capstone EKS
-# cluster: its IAM OIDC provider ARN is passed as EksOidcProviderArn,
-# and its issuer host is pasted as a LITERAL into the trust-policy
-# Condition key (CloudFormation cannot template a policy Condition key).
+# PROVIDER NOTE: this capstone invokes the model via the Anthropic Messages API
+# directly (key in the app repo's gitignored secrets/anthropic.env), NOT Bedrock.
+# So there is no Bedrock IRSA role, no EKS OIDC dependency, and no IAM-deny budget
+# action — an IAM deny cannot gate Anthropic API spend (it isn't AWS-IAM-gated).
+# The budget-cap CONTRACT is instead:
+#   * detection  -> the CloudWatch alarm below on acme/llmproxy/CostUsd, and the
+#                   AWS Budget's forecast/actual SNS notifications;
+#   * enforcement -> the proxy's CostMiddleware returns a shaped 503 with
+#                    X-Llm-Disabled-Reason: budget_cap when the tally is capped
+#                    (see the app repo's expense-api/COST.md).
+# The Bedrock IRSA role + explicit-deny BudgetsAction remain the documented prod
+# path for an AWS-native Bedrock deployment; they are intentionally out of scope
+# here (would re-introduce the EKS OIDC dependency this stack no longer needs).
 #
-# SHARED-ACCOUNT NOTE: account 726695008378 is shared across team67, so
-# every named resource carries the `-aaron` trainee suffix (same
-# convention as the W6 D1/D3 resources). See expense-api/INFRA.md.
+# SHARED-ACCOUNT NOTE: account 726695008378 is shared across team67, so every
+# named resource carries the `-aaron` trainee suffix. See expense-api/INFRA.md.
 #
-# Every taggable resource carries the FOUR mandatory cost-allocation
-# keys (service / env / tenant / feature); activate them once in the
-# Billing console (activation does not backfill).
+# Every taggable resource carries the FOUR mandatory cost-allocation keys
+# (service / env / tenant / feature); activate them once in the Billing console
+# (activation does not backfill).
 #
-# Deploy with the ChangeSet flow (same as W6 D3):
+# Deploy with the ChangeSet flow (same as W6 D3). No CAPABILITY_NAMED_IAM — this
+# stack creates no IAM resources:
 #   aws cloudformation create-change-set \
 #     --stack-name expense-cost-dev-aaron \
 #     --change-set-name initial --change-set-type CREATE \
-#     --capabilities CAPABILITY_NAMED_IAM \
 #     --template-body file://cfn/expense-cost-dev.yaml \
 #     --parameters ParameterKey=EnvName,ParameterValue=dev \
-#                  ParameterKey=EksOidcProviderArn,ParameterValue=arn:aws:iam::726695008378:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE0123456789 \
 #     --tags Key=trainee,Value=aaron-amartuvshin Key=team,Value=team67 Key=environment,Value=training \
 #     --region us-east-1
 #   aws cloudformation describe-change-set ... # paste into PR body
 #   aws cloudformation execute-change-set ...
 AWSTemplateFormatVersion: "2010-09-09"
-Description: expense cost stack -- Bedrock IRSA, SNS, alarm, budget, CUR bucket (aaron).
+Description: expense cost stack -- SNS, cost alarm, monthly budget, CUR bucket (aaron).
 
 Parameters:
   EnvName:
@@ -41,34 +46,20 @@ Parameters:
     AllowedValues: [dev, staging, prod]
     Description: Deployment environment.
   MonthlyBudgetUsd:
-    # Hard cap for the month. Below 80% the budget is silent; at 80%
-    # the SNS topic gets a FORECASTED notification; at 100% ACTUAL the
-    # BudgetsAction attaches the deny policy automatically.
+    # Hard cap for the month. Below 80% the budget is silent; at 80% the SNS
+    # topic gets a FORECASTED notification; at 100% ACTUAL a second SNS message.
+    # Enforcement is app-level (shaped 503), not an IAM deny — see the header.
     Type: Number
     Default: 2500
     MinValue: 100
     MaxValue: 100000
-    Description: Monthly Bedrock spend cap, USD.
-  BedrockModelId:
-    Type: String
-    Default: anthropic.claude-3-5-haiku-20241022-v1:0
-    Description: Foundation model id; pinned for explicit IAM scope (never a bedrock wildcard).
-  EksOidcProviderArn:
-    # IAM OIDC provider ARN of the SHARED, platform-provided capstone EKS
-    # cluster -- NOT an export of any stack you own. Look it up once:
-    #   aws eks describe-cluster --name <cohort-cluster> \
-    #     --query cluster.identity.oidc.issuer --output text
-    #   aws iam list-open-id-connect-providers   # match the issuer host
-    # (The issuer host itself is a literal in the trust Condition key
-    # below -- CloudFormation cannot template a policy Condition key.)
-    Type: String
-    Description: OIDC provider ARN of the shared capstone EKS cluster.
+    Description: Monthly LLM spend cap, USD.
 
 Resources:
-  # --- Cost-alarms SNS topic. Fan-out target for every cost alarm here
-  # plus the budget's forecasted/actual notifications. Subscribers
-  # (Slack webhook Lambda, PagerDuty) live in their own CFN resources so
-  # the alarm contract stays decoupled from the delivery channel.
+  # --- Cost-alarms SNS topic. Fan-out target for the cost alarm plus the budget's
+  # forecasted/actual notifications. Subscribers (Slack webhook Lambda, PagerDuty)
+  # live in their own CFN resources so the alarm contract stays decoupled from the
+  # delivery channel.
   CostAlarmsTopic:
     Type: AWS::SNS::Topic
     Properties:
@@ -80,92 +71,12 @@ Resources:
         - {Key: tenant,  Value: shared}
         - {Key: feature, Value: categorize-expense}
 
-  # --- The IRSA role the EKS pod assumes to call Bedrock. Trust policy
-  # federates to the SHARED capstone cluster's IAM OIDC provider (passed
-  # as EksOidcProviderArn); the sub claim is pinned EXACTLY to the
-  # namespace + service account. Permission policy is exactly ONE Action
-  # on exactly ONE Resource ARN -- never a bedrock wildcard, never a wildcard resource.
-  BedrockInvokeRole:
-    Type: AWS::IAM::Role
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W28
-            reason: >-
-              Explicit RoleName so the EKS service account annotation
-              (eks.amazonaws.com/role-arn) can hard-reference a stable ARN;
-              the -aaron suffix already prevents a shared-account collision.
-    Properties:
-      RoleName: expense-bedrock-invoke-aaron
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              # Value position: an intrinsic (!Ref) is allowed here.
-              Federated: !Ref EksOidcProviderArn
-            Action: sts:AssumeRoleWithWebIdentity
-            Condition:
-              # StringEquals (NOT StringLike): the IRSA sub claim is a
-              # single literal value. Any wildcard here is a cluster-wide
-              # privilege-escalation footgun.
-              #
-              # The Condition KEY is "<issuer-host>:sub". It MUST be a
-              # literal -- CloudFormation cannot use !Ref/!Sub in a policy
-              # Condition key (an intrinsic can't be a JSON key). Paste your
-              # shared cluster's issuer host (strip https://) from:
-              #   aws eks describe-cluster \
-              #     --query cluster.identity.oidc.issuer --output text
-              StringEquals:
-                "oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE0123456789:sub": "system:serviceaccount:expense-dev:expense-svc"
-      Policies:
-        - PolicyName: bedrock-invoke-narrow
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: BedrockInvokeOneModel
-                Effect: Allow
-                Action: bedrock:InvokeModel
-                # The exact ARN of the one foundation model this role may
-                # invoke. A second model is a new PR + new ARN, not a wildcard.
-                Resource:
-                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
-      Tags:
-        - {Key: service, Value: expense}
-        - {Key: env,     Value: !Ref EnvName}
-        - {Key: tenant,  Value: shared}
-        - {Key: feature, Value: categorize-expense}
-
-  # --- Explicit-deny policy attached on budget-cap breach. Detached as
-  # part of the human reset flow when the month rolls over OR finance
-  # approves an increase. The proxy MUST catch AccessDeniedException and
-  # return a shaped 503 with X-Llm-Disabled-Reason: budget_cap, not a 500.
-  BedrockDenyOnBudget:
-    Type: AWS::IAM::ManagedPolicy
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W28
-            reason: >-
-              Explicit ManagedPolicyName so the BudgetsAction can reference a
-              stable policy ARN; -aaron prevents a shared-account collision.
-    Properties:
-      ManagedPolicyName: ExpenseBedrockDenyPolicy-aaron
-      Description: Explicit-deny Bedrock invoke; attached by the BudgetsAction at 100% actual.
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: DenyBedrockInvokeOnBudgetCap
-            Effect: Deny
-            Action: bedrock:InvokeModel
-            Resource:
-              - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
-
-  # --- The cost-per-request alarm. Metric is acme/llmproxy/CostUsd
-  # extracted from the EMF emission the proxy filter writes; threshold is
-  # the moving 15-minute average. TreatMissingData: breaching converts
-  # metric SILENCE into an alarm condition -- the not-breaching default is
-  # the silent-pipeline-death failure mode (a dead emitter looks healthy).
+  # --- The cost-per-request alarm. Metric is acme/llmproxy/CostUsd extracted from
+  # the EMF emission the proxy filter writes (provider-agnostic — same metric
+  # whether the upstream is Anthropic API or Bedrock); threshold is the moving
+  # 15-minute average. TreatMissingData: breaching converts metric SILENCE into an
+  # alarm condition -- the not-breaching default is the silent-pipeline-death
+  # failure mode (a dead emitter looks healthy).
   CostPerRequestAlarm:
     Type: AWS::CloudWatch::Alarm
     Metadata:
@@ -173,8 +84,8 @@ Resources:
         rules_to_suppress:
           - id: W28
             reason: >-
-              Explicit AlarmName gives a stable, greppable alarm the spike
-              runbook references by name; -aaron prevents a shared-account clash.
+              Explicit AlarmName gives a stable, greppable alarm the spike runbook
+              references by name; -aaron prevents a shared-account collision.
     Properties:
       AlarmName: expense/cost-per-request-dev-aaron
       AlarmDescription: 15-minute moving average CostUsd > 0.005 USD/call.
@@ -204,46 +115,10 @@ Resources:
           Label: "15m average CostUsd"
           ReturnData: true
 
-  # --- The role the BudgetsAction itself assumes (NOT the IRSA role).
-  # Trust principal is the AWS Budgets service; permission is narrow --
-  # attach/detach ONLY the deny policy ONLY on the invoke role.
-  BudgetActionRole:
-    Type: AWS::IAM::Role
-    Metadata:
-      cfn_nag:
-        rules_to_suppress:
-          - id: W28
-            reason: >-
-              Explicit RoleName keeps the budget-action execution role stable
-              and greppable; -aaron prevents a shared-account collision.
-    Properties:
-      RoleName: !Sub "expense-budget-action-${EnvName}-aaron"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: {Service: budgets.amazonaws.com}
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: attach-deny-policy-narrow
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: AttachDenyToBedrockRole
-                Effect: Allow
-                Action:
-                  - iam:AttachRolePolicy
-                  - iam:DetachRolePolicy
-                Resource:
-                  - !GetAtt BedrockInvokeRole.Arn
-                Condition:
-                  # Only ever attach/detach THIS one deny policy -- not any policy.
-                  ArnEquals:
-                    "iam:PolicyARN": !Ref BedrockDenyOnBudget
-
-  # --- Monthly cost budget. CostFilters scope it to the capstone's
-  # cost-allocation tags (AWS-Budgets user:<tag>$<value> syntax) so it
-  # doesn't sweep in unrelated team67 spend.
+  # --- Monthly cost budget. CostFilters scope it to the capstone's cost-allocation
+  # tags (AWS-Budgets user:<tag>$<value> syntax) so it doesn't sweep in unrelated
+  # team67 spend. Notifications only -- no BudgetsAction (no IAM surface to deny on
+  # the API-key path; enforcement is the proxy's shaped 503).
   MonthlyBudget:
     Type: AWS::Budgets::Budget
     Properties:
@@ -268,8 +143,7 @@ Resources:
           Subscribers:
             - SubscriptionType: SNS
               Address: !Ref CostAlarmsTopic
-        # Hard cap at ACTUAL 100%: SNS fans out + the action below attaches
-        # the deny policy automatically.
+        # Hard cap at ACTUAL 100%: SNS fans out; the proxy's shaped 503 enforces.
         - Notification:
             NotificationType: ACTUAL
             ComparisonOperator: GREATER_THAN
@@ -279,36 +153,10 @@ Resources:
             - SubscriptionType: SNS
               Address: !Ref CostAlarmsTopic
 
-  # --- The BudgetsAction. ApprovalModel AUTOMATIC means no human in the
-  # loop -- the moment actual >= 100% the deny policy attaches. That is
-  # the agreed dev trade-off; the shaped 503 fallback in the proxy keeps
-  # it from being a customer-facing 500. Flip to MANUAL for prod so a
-  # human gates the outage.
-  BudgetActionAttachDeny:
-    Type: AWS::Budgets::BudgetsAction
-    Properties:
-      BudgetName: !Ref MonthlyBudget
-      NotificationType: ACTUAL
-      ActionType: APPLY_IAM_POLICY
-      ApprovalModel: AUTOMATIC
-      ExecutionRoleArn: !GetAtt BudgetActionRole.Arn
-      ActionThreshold:
-        Type: PERCENTAGE
-        Value: 100
-      Definition:
-        IamActionDefinition:
-          PolicyArn: !Ref BedrockDenyOnBudget
-          Roles:
-            - !Ref BedrockInvokeRole
-      Subscribers:
-        - Type: SNS
-          Address: !Ref CostAlarmsTopic
-
-  # --- Cost & Usage Report destination bucket. PAB x4, KMS default
-  # encryption, versioning, 90-day IA transition, deny-non-TLS policy,
-  # BOTH DeletionPolicy: Retain AND UpdateReplacePolicy: Retain so a
-  # property-change replacement or a stack delete never destroys the
-  # historical CUR rows.
+  # --- Cost & Usage Report destination bucket. PAB x4, KMS default encryption,
+  # versioning, 90-day IA transition, deny-non-TLS policy, BOTH DeletionPolicy:
+  # Retain AND UpdateReplacePolicy: Retain so a property-change replacement or a
+  # stack delete never destroys the historical CUR rows.
   CurBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
@@ -370,10 +218,6 @@ Resources:
                 "aws:SecureTransport": "false"
 
 Outputs:
-  BedrockInvokeRoleArn:
-    Description: IRSA role ARN the EKS service account annotates.
-    Value: !GetAtt BedrockInvokeRole.Arn
-    Export: {Name: !Sub "${AWS::StackName}-BedrockInvokeRoleArn"}
   CostAlarmsTopicArn:
     Description: SNS topic ARN; Slack + PagerDuty subscribers live in their own CFN.
     Value: !Ref CostAlarmsTopic
