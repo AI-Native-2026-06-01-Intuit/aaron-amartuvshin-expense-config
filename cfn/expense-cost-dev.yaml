@@ -54,6 +54,17 @@ Parameters:
     MinValue: 100
     MaxValue: 100000
     Description: Monthly LLM spend cap, USD.
+  DeployBudget:
+    # The AWS Budget is created by default. Set "false" when the deploying principal
+    # lacks budgets:ModifyBudget (e.g. the shared training IAM user) so the rest of
+    # the stack still deploys; the budget resource stays defined in-template.
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Create the AWS Budget (needs budgets:ModifyBudget on the deploy principal).
+
+Conditions:
+  WithBudget: !Equals [!Ref DeployBudget, "true"]
 
 Resources:
   # --- Cost-alarms SNS topic. Fan-out target for the cost alarm plus the budget's
@@ -88,32 +99,28 @@ Resources:
               references by name; -aaron prevents a shared-account collision.
     Properties:
       AlarmName: expense/cost-per-request-dev-aaron
-      AlarmDescription: 15-minute moving average CostUsd > 0.005 USD/call.
+      # Sustained cost: three consecutive 5-minute averages (= 15 min) over threshold.
+      # NB: a metric-math AVG(m1) collapses the series to a scalar and CloudWatch
+      # rejects it ("return value must be TimeSeries") — the moving window is
+      # expressed by Period(300) x EvaluationPeriods(3), alarming on the average
+      # metric directly, not by a metric-math expression.
+      AlarmDescription: 5-minute average CostUsd > 0.005 USD/call for 3 periods (15 min).
       ActionsEnabled: true
       AlarmActions: [!Ref CostAlarmsTopic]
       OKActions:    [!Ref CostAlarmsTopic]
       InsufficientDataActions: [!Ref CostAlarmsTopic]
+      Namespace: "acme/llmproxy"
+      MetricName: "CostUsd"
+      Dimensions:
+        - {Name: service, Value: expense}
+        - {Name: feature, Value: categorize-expense}
+      Period: 300
+      Statistic: Average
       EvaluationPeriods: 3
       DatapointsToAlarm: 3
       Threshold: 0.005
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: breaching        # metric silence == breach; never the not-breaching default.
-      Metrics:
-        - Id: m1
-          MetricStat:
-            Metric:
-              Namespace: "acme/llmproxy"
-              MetricName: "CostUsd"
-              Dimensions:
-                - {Name: service, Value: expense}
-                - {Name: feature, Value: categorize-expense}
-            Period: 300
-            Stat: Average
-          ReturnData: false
-        - Id: e1
-          Expression: "AVG(m1)"
-          Label: "15m average CostUsd"
-          ReturnData: true
 
   # --- Monthly cost budget. CostFilters scope it to the capstone's cost-allocation
   # tags (AWS-Budgets user:<tag>$<value> syntax) so it doesn't sweep in unrelated
@@ -121,6 +128,7 @@ Resources:
   # the API-key path; enforcement is the proxy's shaped 503).
   MonthlyBudget:
     Type: AWS::Budgets::Budget
+    Condition: WithBudget
     Properties:
       Budget:
         BudgetName: expense-monthly-cost-dev-aaron
@@ -223,6 +231,7 @@ Outputs:
     Value: !Ref CostAlarmsTopic
     Export: {Name: !Sub "${AWS::StackName}-CostAlarmsTopicArn"}
   MonthlyBudgetName:
+    Condition: WithBudget
     Value: !Ref MonthlyBudget
     Export: {Name: !Sub "${AWS::StackName}-MonthlyBudgetName"}
   CurBucketName:
