@@ -1,0 +1,79 @@
+# .github/workflows/cfn-validate.yml
+# TASK 4 CI gate: every PR (and push to main) that touches cfn/ runs cfn-lint,
+# cfn-nag, and `aws cloudformation validate-template` against all four templates.
+# Failures BLOCK merge (set this as a required status check on main).
+#
+# ADAPTED FROM THE REFERENCE (our env):
+#   * runs-on [self-hosted, mac-local], NOT ubuntu-24.04 — this org has no
+#     GitHub-hosted Linux runner (self-hosted-only policy). Same runner the app
+#     repo's docker.yml / serverless.yml use.
+#   * cfn-lint + cfn-nag run via `docker run` on Rancher (moby), exactly how the
+#     app repo runs hadolint + Trivy — the macOS self-hosted runner can't use the
+#     Linux container-actions, and cfn-nag's old kwalify dep won't install on a
+#     modern local ruby. Images: cfn-lint via a pinned python image, cfn-nag via
+#     stelligent/cfn_nag.
+#   * validate-template uses OIDC against the bootstrap stack's -aaron deploy role.
+name: cfn-validate
+
+on:
+  pull_request:
+    paths:
+      - "cfn/**"
+      - ".github/workflows/cfn-validate.yml"
+  push:
+    branches: [main]
+    paths:
+      - "cfn/**"
+      - ".github/workflows/cfn-validate.yml"
+
+permissions:
+  contents: read       # checkout
+  id-token: write      # OIDC for the aws cli
+
+# Older self-hosted runner mishandles the Node 24 JS-action wrapper; pin Node 20.
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
+
+concurrency:
+  group: cfn-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: cfn-lint + cfn-nag + aws validate-template
+    runs-on: [self-hosted, mac-local]
+    timeout-minutes: 15
+    steps:
+      - name: Check out config repo
+        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608  # v4.1.7
+
+      # cfn-lint via a pinned python image (Rancher docker). Deterministic + no
+      # PEP-668 externally-managed-env fight with the runner's system python.
+      - name: cfn-lint (all templates)
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w --entrypoint sh python:3.12-slim -c \
+            "pip install --quiet cfn-lint==1.53.0 && cfn-lint cfn/*.yaml"
+
+      # cfn-nag with --fail-on-warnings; every legitimate warning is suppressed
+      # in-template with a documented reason, so a clean run is 0 failures + 0
+      # unsuppressed warnings.
+      - name: cfn-nag (fail on warnings)
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w --entrypoint cfn_nag_scan \
+            stelligent/cfn_nag:latest --input-path cfn --fail-on-warnings
+
+      - name: Configure AWS credentials (OIDC, read-only subset)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4.0.2
+        with:
+          role-to-assume: arn:aws:iam::726695008378:role/expense-api-cfn-deploy-aaron
+          aws-region:     us-east-1
+
+      - name: aws cloudformation validate-template (all four)
+        run: |
+          for t in bootstrap network app artifacts; do
+            echo "== validating expense-${t}-dev.yaml =="
+            aws cloudformation validate-template \
+              --template-body "file://cfn/expense-${t}-dev.yaml" \
+              --region us-east-1 >/dev/null
+          done
+          echo "all templates valid"
