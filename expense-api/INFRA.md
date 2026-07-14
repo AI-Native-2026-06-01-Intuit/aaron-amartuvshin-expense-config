@@ -70,20 +70,21 @@ safety this buys: an active import **blocks deletion of the exporting stack** �
 `expense-network-dev-aaron` while the app stack imports it is refused with
 `Export ... cannot be deleted as it is in use by expense-app-dev-aaron`.
 
-## Secrets: dynamic reference, never a NoEcho parameter
+## Secrets: CFN-managed secret + dynamic reference, never a NoEcho parameter
 
 The RDS master password is **never** a template `Parameter` (a `NoEcho` parameter still
-lands in the parameter store/history and in tooling paths). The secret is created once
-per env out-of-band:
+lands in the parameter store/history and in tooling paths). Instead the app stack:
 
-```bash
-aws secretsmanager create-secret --name expense/dev/db-master-aaron \
-    --secret-string '{"username":"expense_master","password":"..."}' --region us-east-1
-```
-
-and resolved at deploy time via the dynamic reference
-`{{resolve:secretsmanager:expense/dev/db-master-aaron:SecretString:password}}`. CFN
-substitutes it straight into the RDS API call; the plaintext never enters template state.
+1. **Creates the secret in-stack** — `AWS::SecretsManager::Secret` `DbMasterSecret` with
+   `GenerateSecretString` (CFN generates the 32-char password at create time; no plaintext
+   input ever exists), `DeletionPolicy: Retain` + `UpdateReplacePolicy: Retain`.
+2. **Resolves it into the RDS** via the dynamic reference
+   `{{resolve:secretsmanager:expense/dev/db-master-aaron:SecretString:password}}` — CFN
+   substitutes the value straight into the RDS API call; it never enters template state.
+   The `DbInstance` carries `DependsOn: DbMasterSecret` because a dynamic reference does
+   **not** create a dependency, so creation order must be pinned explicitly.
+3. **Binds them** with `AWS::SecretsManager::SecretTargetAttachment` so Secrets Manager
+   rotation can target the live DB ARN and the secret records host/port/dbname.
 
 ## Drift verification
 
@@ -106,15 +107,13 @@ an out-of-band console change before it becomes an un-rollbackable 3am surprise.
   can't `gem install` on a modern local ruby (its old `kwalify` dep breaks on ruby ≥ 4),
   so the container is the portable path. `validate-template` uses OIDC against
   `expense-api-cfn-deploy-aaron`.
-- **App stack uses the out-of-band secret + dynamic reference only** — the reference
-  scaffold *also* declares an in-stack `AWS::SecretsManager::Secret` (GenerateSecretString)
-  + `SecretTargetAttachment`. Dropped here: Task 3 calls for the out-of-band + dynamic-ref
-  pattern, the bare `expense/dev/db-master` name is already taken in the shared account,
-  and keeping the secret out-of-band keeps teardown clean.
-- **`DeletionProtection: false` on the dev RDS** — so this training stack tears down
-  without a manual protection-disable dance. `DeletionPolicy: Retain` +
-  `UpdateReplacePolicy: Retain` still guard against accidental data loss. staging/prod flip
-  this `true`.
+- **App stack manages the secret in-stack** — `DbMasterSecret` (GenerateSecretString) +
+  `SecretTargetAttachment`, resolved via dynamic reference (see the Secrets section). An
+  earlier revision hand-created the secret out-of-band and resolved that; switched to the
+  in-stack pattern on ES review (W6D3) so CFN owns the credential lifecycle end-to-end.
+- **`DeletionProtection: true` on the RDS** — the instance can't be dropped by accident;
+  a genuine teardown disables it first (`modify-db-instance --no-deletion-protection`).
+  `DeletionPolicy: Retain` + `UpdateReplacePolicy: Retain` add stack-level guards.
 - **PostgreSQL `16.9`** — the reference's `16.3`/`16.4` are now deprecated for new
   instances (cfn-lint W3691); `16.9` is a current non-deprecated 16.x.
 - **VPC flow logs omitted in dev** (cfn-nag W60 suppressed) — they add CloudWatch/S3
@@ -140,8 +139,14 @@ avoided:
 3. **`DeletionPolicy: Retain` without its `UpdateReplacePolicy: Retain` pair** → every stateful
    resource (three S3 buckets across bootstrap/artifacts, the RDS instance) carries **both**.
 
-**Rejected** one piece of the reference scaffold: the in-stack `AWS::SecretsManager::Secret`
-+ `SecretTargetAttachment` in the app stack. Reason: Task 3 mandates the out-of-band secret +
-dynamic-reference pattern, the in-stack secret name collides with the pre-existing shared
-`expense/dev/db-master`, and an out-of-band secret keeps a single authoritative credential and
-a clean stack teardown. The rotation-attachment convenience wasn't worth those three costs here.
+**Rejected** the scaffold's cost-carrying dev extras — a **dedicated KMS CMK** for the DB
+secret (cfn-nag W77) and a **VPC flow log** (W60). In dev these use the AWS-managed
+`aws/secretsmanager` key and no flow log respectively, each a dated in-template suppression
+with a staging/prod-flips-this note. The ~$0 training-account policy makes a per-env CMK and
+always-on flow-log delivery not worth their cost here; they belong in the hardened envs.
+
+**Incorporated on ES review (W6D3):** an earlier revision hand-created the DB secret
+out-of-band and set `DeletionProtection: false` for a clean teardown. On feedback, the app
+stack now **owns** the secret in-stack (`DbMasterSecret` + `SecretTargetAttachment`) and runs
+with `DeletionProtection: true` — accident-proofing wins over teardown convenience, and CFN
+owning the credential lifecycle is the stronger pattern.
