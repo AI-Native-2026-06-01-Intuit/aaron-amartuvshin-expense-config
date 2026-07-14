@@ -132,6 +132,11 @@ Resources:
               iam:PassRole is scoped to the arn:aws:iam::<acct>:role/expense-* prefix
               (the roles these stacks themselves create), not Resource '*'; a prefix
               is the least-privilege shape for a CFN deploy role.
+          - id: W11
+            reason: >-
+              The one Resource:'*' statement is cloudformation:ValidateTemplate ONLY,
+              which has no resource-level permission support (AWS denies it under any
+              ARN scope). Every other action stays scoped to expense-*/role/expense-*.
     Properties:
       RoleName: expense-api-cfn-deploy-aaron
       AssumeRolePolicyDocument:
@@ -167,13 +172,20 @@ Resources:
                   - cloudformation:DescribeStackEvents
                   - cloudformation:DescribeStackResources
                   - cloudformation:GetTemplate
-                  - cloudformation:ValidateTemplate
                   - cloudformation:DetectStackDrift
                   - cloudformation:DescribeStackDriftDetectionStatus
                   - cloudformation:DescribeStackResourceDrifts
                 Resource:
                   - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/expense-*"
                   - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/expense-*"
+              # ValidateTemplate has NO resource-level permission support — it
+              # validates a template body, not a stack. Scoping it to stack/expense-*
+              # would deny it outright, so it needs its own Resource: "*" statement
+              # (the CI validate-template step depends on this).
+              - Sid: CfnValidateTemplate
+                Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: "*"
               # S3 read on the bootstrap bucket (for stored templates).
               - Sid: BootstrapBucketRead
                 Effect: Allow
