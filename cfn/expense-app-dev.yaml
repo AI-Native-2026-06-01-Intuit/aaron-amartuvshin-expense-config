@@ -159,7 +159,10 @@ Resources:
       PubliclyAccessible:    false
       MultiAZ:               false
       BackupRetentionPeriod: 7
-      DeletionProtection:    false
+      # DeletionProtection ON so the instance can't be dropped by accident. For a
+      # genuine teardown, disable it first (modify-db-instance --no-deletion-protection),
+      # then delete. DeletionPolicy + UpdateReplacePolicy Retain add stack-level guards.
+      DeletionProtection:    true
       MasterUsername:
         "Fn::Sub": "{{resolve:secretsmanager:${SecretName}:SecretString:username}}"
       MasterUserPassword:
