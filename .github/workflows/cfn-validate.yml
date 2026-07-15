@@ -68,9 +68,9 @@ jobs:
           role-to-assume: arn:aws:iam::726695008378:role/expense-api-cfn-deploy-aaron
           aws-region:     us-east-1
 
-      - name: aws cloudformation validate-template (all four)
+      - name: aws cloudformation validate-template (all six)
         run: |
-          for t in bootstrap network app artifacts; do
+          for t in bootstrap network app artifacts cost observability; do
             echo "== validating expense-${t}-dev.yaml =="
             aws cloudformation validate-template \
               --template-body "file://cfn/expense-${t}-dev.yaml" \
