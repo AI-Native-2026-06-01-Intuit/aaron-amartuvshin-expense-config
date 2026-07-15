@@ -1,0 +1,19 @@
+# k8s/expense-api/pdb.yaml
+# TASK 2: PodDisruptionBudget for expense-api. Paired with the Karpenter
+# NodePool at k8s/platform/expense-mixed.yaml -- the NodePool does the Spot/
+# On-Demand bin-packing, the PDB stops a simultaneous Spot-reclaim wave from
+# taking the floor below the HPA's minReplicas: 2 (Section 9 sticking point
+# #2: a missing PDB lets Karpenter consolidation or a regional Spot
+# interruption drain every replica at once).
+#
+# minAvailable: 2 matches hpa.yaml's minReplicas: 2 exactly -- the floor the
+# HPA guarantees is the same floor the PDB protects.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: expense-api-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: expense-api
