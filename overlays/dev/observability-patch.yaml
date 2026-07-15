@@ -1,0 +1,45 @@
+# overlays/dev/observability-patch.yaml
+#
+# W6 D5: re-connects the W5 D5 observability layer (k8s profile, in-cluster
+# JWT public-key validation, OTel SDK export) to the GitOps-managed dev
+# Deployment. It was previously applied out-of-band via
+# scripts/observability-apply.sh's `kubectl patch` (before the W6 D2 GitOps
+# cutover); once Argo CD took over with selfHeal: true, that manual patch
+# would have been reverted on the very next sync -- SPRING_PROFILES_ACTIVE
+# silently stayed `smoke` in the live dev Application ever since (confirmed
+# live: `kubectl -n expense-dev get cm expense-api-config` showed `smoke`,
+# not `k8s`). Re-applied HERE, in git, so Argo CD keeps it instead of
+# quietly reverting it every reconcile.
+#
+# Scoped to the dev overlay ONLY -- staging/prod stay on `smoke` until this
+# is vetted through a normal promotion (same caution INFRA.md applies to
+# dev-only cost suppressions).
+#
+# Deliberately NOT re-attaching the W5D5 OTel Java agent init container: the
+# app already ships its own OTel SDK auto-instrumentation via the
+# `opentelemetry-spring-boot-starter` dependency (W3 D5), so pointing
+# OTEL_EXPORTER_OTLP_ENDPOINT at the in-cluster collector (the ConfigMap patch
+# below) and flipping OTEL_SDK_DISABLED=false is enough -- no extra init
+# container, no GitHub-release download on every pod start.
+#
+# The `expense-jwt-pubkey` ConfigMap this mounts is declared in
+# 41-jwt-pubkey-configmap.yaml (this overlay) from the repo's
+# jwt-public.pem -- a PUBLIC key, safe to commit; the matching PRIVATE key
+# stays local + gitignored in the app repo (scripts/mint-jwt.sh signs with it).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: expense-api
+spec:
+  template:
+    spec:
+      volumes:
+        - name: jwt-pubkey
+          configMap:
+            name: expense-jwt-pubkey
+      containers:
+        - name: expense-api
+          volumeMounts:
+            - name: jwt-pubkey
+              mountPath: /etc/observability
+              readOnly: true

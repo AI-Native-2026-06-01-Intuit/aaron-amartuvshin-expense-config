@@ -1,0 +1,29 @@
+# overlays/dev/41-jwt-pubkey-configmap.yaml
+#
+# The RS256 PUBLIC key K8sJwtDecoderConfig (app repo, @Profile("k8s")) validates
+# in-cluster JWTs against. Safe to commit -- it is a public key; the matching
+# PRIVATE key that scripts/mint-jwt.sh signs with stays local + gitignored in
+# the app repo (never in either repo's git history).
+#
+# This ConfigMap already existed in the live expense-dev namespace (created
+# out-of-band by scripts/observability-apply.sh before the W6 D2 GitOps
+# cutover) with byte-identical content (verified: `openssl pkey -pubin`
+# DER-SHA256 fingerprint matches the app repo's committed jwt-public.pem).
+# Declaring it here brings it under Argo CD management instead of leaving it
+# as a resource Argo doesn't own/track — same name/namespace, so Argo adopts
+# it in place on the next sync rather than replacing it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: expense-jwt-pubkey
+data:
+  jwt-public.pem: |
+    -----BEGIN PUBLIC KEY-----
+    MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtPnaKBh+v9AQ8LIMO+bx
+    TDsCFis5zocRqZkYXx5IjquaDhGkhI/dxO7Ue8AGmwDERaM5j2wZBNoSlp4lEjoN
+    zgnKj0JNvr4nGBe9GSSVvkIxJjTPDBUhPOqzfU8F4wqC8kwFwzXhODTmytL3d4qc
+    w1M/Ysefq67lzuqnyPgNRez16scZEpJYkg5oRWAc/MxSSwPiBK1WTmPRoxdp9hOf
+    BpUbo8J5HgfGr+dvWXawi2E8gxwddGY5MU8uNre3leTsRH0NeQGHs5WqHHE81Q1L
+    GEIrHKUBLIxxPZRUqFNSiq2kyJIsaOQWEM4Xe6RShfZwnszTRV6R7v/Bm216LUEW
+    HwIDAQAB
+    -----END PUBLIC KEY-----
