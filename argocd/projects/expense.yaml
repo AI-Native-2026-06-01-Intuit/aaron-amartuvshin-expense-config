@@ -41,6 +41,13 @@ spec:
     - { group: networking.k8s.io, kind: NetworkPolicy }
     - { group: monitoring.coreos.com, kind: ServiceMonitor }
     - { group: monitoring.coreos.com, kind: PrometheusRule }
+    # W6 D5: KEDA scales expense-api-worker on SQS queue depth. Namespace-scoped
+    # only (ScaledObject/TriggerAuthentication) -- the keda.sh CRDs themselves
+    # and the keda namespace/operator stay platform-owned (installed by hand via
+    # `helm install keda kedacore/keda -n keda`, same as KEDA isn't something an
+    # app-team Application should be provisioning).
+    - { group: keda.sh, kind: ScaledObject }
+    - { group: keda.sh, kind: TriggerAuthentication }
 
   # Quota knobs are platform-owned — explicitly denied.
   namespaceResourceBlacklist:
