@@ -1,0 +1,239 @@
+# cfn/expense-cost-dev.yaml
+# W6 D4 cost stack: the LLM cost-monitoring substrate — an SNS fan-out topic for
+# cost alarms, a per-request CloudWatch alarm keyed on the EMF metric the proxy
+# emits, a monthly AWS Budget with forecasted-80% + actual-100% SNS notifications,
+# and a hardened S3 bucket for Cost & Usage Report rows.
+#
+# PROVIDER NOTE: this capstone invokes the model via the Anthropic Messages API
+# directly (key in the app repo's gitignored secrets/anthropic.env), NOT Bedrock.
+# So there is no Bedrock IRSA role, no EKS OIDC dependency, and no IAM-deny budget
+# action — an IAM deny cannot gate Anthropic API spend (it isn't AWS-IAM-gated).
+# The budget-cap CONTRACT is instead:
+#   * detection  -> the CloudWatch alarm below on acme/llmproxy/CostUsd, and the
+#                   AWS Budget's forecast/actual SNS notifications;
+#   * enforcement -> the proxy's CostMiddleware returns a shaped 503 with
+#                    X-Llm-Disabled-Reason: budget_cap when the tally is capped
+#                    (see the app repo's expense-api/COST.md).
+# The Bedrock IRSA role + explicit-deny BudgetsAction remain the documented prod
+# path for an AWS-native Bedrock deployment; they are intentionally out of scope
+# here (would re-introduce the EKS OIDC dependency this stack no longer needs).
+#
+# SHARED-ACCOUNT NOTE: account 726695008378 is shared across team67, so every
+# named resource carries the `-aaron` trainee suffix. See expense-api/INFRA.md.
+#
+# Every taggable resource carries the FOUR mandatory cost-allocation keys
+# (service / env / tenant / feature); activate them once in the Billing console
+# (activation does not backfill).
+#
+# Deploy with the ChangeSet flow (same as W6 D3). No CAPABILITY_NAMED_IAM — this
+# stack creates no IAM resources:
+#   aws cloudformation create-change-set \
+#     --stack-name expense-cost-dev-aaron \
+#     --change-set-name initial --change-set-type CREATE \
+#     --template-body file://cfn/expense-cost-dev.yaml \
+#     --parameters ParameterKey=EnvName,ParameterValue=dev \
+#     --tags Key=trainee,Value=aaron-amartuvshin Key=team,Value=team67 Key=environment,Value=training \
+#     --region us-east-1
+#   aws cloudformation describe-change-set ... # paste into PR body
+#   aws cloudformation execute-change-set ...
+AWSTemplateFormatVersion: "2010-09-09"
+Description: expense cost stack -- SNS, cost alarm, monthly budget, CUR bucket (aaron).
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment.
+  MonthlyBudgetUsd:
+    # Hard cap for the month. Below 80% the budget is silent; at 80% the SNS
+    # topic gets a FORECASTED notification; at 100% ACTUAL a second SNS message.
+    # Enforcement is app-level (shaped 503), not an IAM deny — see the header.
+    Type: Number
+    Default: 2500
+    MinValue: 100
+    MaxValue: 100000
+    Description: Monthly LLM spend cap, USD.
+  DeployBudget:
+    # The AWS Budget is created by default. Set "false" when the deploying principal
+    # lacks budgets:ModifyBudget (e.g. the shared training IAM user) so the rest of
+    # the stack still deploys; the budget resource stays defined in-template.
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Create the AWS Budget (needs budgets:ModifyBudget on the deploy principal).
+
+Conditions:
+  WithBudget: !Equals [!Ref DeployBudget, "true"]
+
+Resources:
+  # --- Cost-alarms SNS topic. Fan-out target for the cost alarm plus the budget's
+  # forecasted/actual notifications. Subscribers (Slack webhook Lambda, PagerDuty)
+  # live in their own CFN resources so the alarm contract stays decoupled from the
+  # delivery channel.
+  CostAlarmsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: expense-cost-alarms-dev-aaron
+      KmsMasterKeyId: alias/aws/sns        # SSE at rest with the AWS-managed SNS key.
+      Tags:
+        - {Key: service, Value: expense}
+        - {Key: env,     Value: !Ref EnvName}
+        - {Key: tenant,  Value: shared}
+        - {Key: feature, Value: categorize-expense}
+
+  # --- The cost-per-request alarm. Metric is acme/llmproxy/CostUsd extracted from
+  # the EMF emission the proxy filter writes (provider-agnostic — same metric
+  # whether the upstream is Anthropic API or Bedrock); threshold is the moving
+  # 15-minute average. TreatMissingData: breaching converts metric SILENCE into an
+  # alarm condition -- the not-breaching default is the silent-pipeline-death
+  # failure mode (a dead emitter looks healthy).
+  CostPerRequestAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit AlarmName gives a stable, greppable alarm the spike runbook
+              references by name; -aaron prevents a shared-account collision.
+    Properties:
+      AlarmName: expense/cost-per-request-dev-aaron
+      # Sustained cost: three consecutive 5-minute averages (= 15 min) over threshold.
+      # NB: a metric-math AVG(m1) collapses the series to a scalar and CloudWatch
+      # rejects it ("return value must be TimeSeries") — the moving window is
+      # expressed by Period(300) x EvaluationPeriods(3), alarming on the average
+      # metric directly, not by a metric-math expression.
+      AlarmDescription: 5-minute average CostUsd > 0.005 USD/call for 3 periods (15 min).
+      ActionsEnabled: true
+      AlarmActions: [!Ref CostAlarmsTopic]
+      OKActions:    [!Ref CostAlarmsTopic]
+      InsufficientDataActions: [!Ref CostAlarmsTopic]
+      Namespace: "acme/llmproxy"
+      MetricName: "CostUsd"
+      Dimensions:
+        - {Name: service, Value: expense}
+        - {Name: feature, Value: categorize-expense}
+      Period: 300
+      Statistic: Average
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 0.005
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching        # metric silence == breach; never the not-breaching default.
+
+  # --- Monthly cost budget. CostFilters scope it to the capstone's cost-allocation
+  # tags (AWS-Budgets user:<tag>$<value> syntax) so it doesn't sweep in unrelated
+  # team67 spend. Notifications only -- no BudgetsAction (no IAM surface to deny on
+  # the API-key path; enforcement is the proxy's shaped 503).
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Condition: WithBudget
+    Properties:
+      Budget:
+        BudgetName: expense-monthly-cost-dev-aaron
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+        CostFilters:
+          TagKeyValue:
+            - "user:service$expense"
+            - !Sub "user:env$${EnvName}"
+      NotificationsWithSubscribers:
+        # Early warning at FORECASTED 80%: SNS to finance.
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref CostAlarmsTopic
+        # Hard cap at ACTUAL 100%: SNS fans out; the proxy's shaped 503 enforces.
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref CostAlarmsTopic
+
+  # --- Cost & Usage Report destination bucket. PAB x4, KMS default encryption,
+  # versioning, 90-day IA transition, deny-non-TLS policy, BOTH DeletionPolicy:
+  # Retain AND UpdateReplacePolicy: Retain so a property-change replacement or a
+  # stack delete never destroys the historical CUR rows.
+  CurBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: >-
+              Access logging intentionally omitted for this dev CUR bucket; a
+              dedicated log-delivery bucket is out of scope for the training env.
+    Properties:
+      BucketName: !Sub "uptimecrew-expense-cur-${EnvName}-aaron-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: alias/aws/s3
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls:       true
+        BlockPublicPolicy:     true
+        IgnorePublicAcls:      true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ia-after-90-days
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 90
+      Tags:
+        - {Key: service, Value: expense}
+        - {Key: env,     Value: !Ref EnvName}
+        - {Key: tenant,  Value: shared}
+        - {Key: feature, Value: categorize-expense}
+
+  CurBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CurBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonTLS
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt CurBucket.Arn
+              - !Sub "${CurBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+Outputs:
+  CostAlarmsTopicArn:
+    Description: SNS topic ARN; Slack + PagerDuty subscribers live in their own CFN.
+    Value: !Ref CostAlarmsTopic
+    Export: {Name: !Sub "${AWS::StackName}-CostAlarmsTopicArn"}
+  MonthlyBudgetName:
+    Condition: WithBudget
+    Value: !Ref MonthlyBudget
+    Export: {Name: !Sub "${AWS::StackName}-MonthlyBudgetName"}
+  CurBucketName:
+    Value: !Ref CurBucket
+    Export: {Name: !Sub "${AWS::StackName}-CurBucketName"}
