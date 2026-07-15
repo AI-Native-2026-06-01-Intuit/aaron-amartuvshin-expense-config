@@ -1,0 +1,111 @@
+# k8s/platform/expense-mixed.yaml
+# TASK 2: Karpenter NodePool mixing Spot + On-Demand, paired with the PDB at
+# k8s/expense-api/pdb.yaml protecting the expense-api floor from a
+# simultaneous Spot reclaim (Section 9 sticking point #2: a regional Spot
+# price move reclaiming 60% of the pool over 90 seconds without a PDB drains
+# the floor and pages on-call).
+#
+# UPDATE (mid-deliverable): the curriculum's own environment prerequisite --
+# "Karpenter v1.0+ installed with an EC2NodeClass the platform team owns" --
+# did not hold for this cohort; the instructor's Slack update confirmed no
+# EKS cluster would be provided, then (independently) confirmed a fresh
+# training EKS cluster (`aaron-amartuvshin-expense-training`, us-east-1,
+# created mid-session) WAS stood up. A teammate separately suggested
+# `karpenter-provider-kwok` as a local/cost-free mock. Combining both: this
+# NodePool runs FOR REAL against that EKS cluster's real OIDC-enabled control
+# plane, using the upstream `sigs.k8s.io/karpenter/kwok` cloud provider
+# (built from source with `ko`, pushed to `karpenter-kwok-aaron/kwok` in this
+# account's ECR, `helm install`ed into the `karpenter` namespace) instead of
+# the AWS cloud provider -- so Karpenter's real scheduling/bin-packing/
+# consolidation logic runs against REAL API objects (NodePool, NodeClaim) on
+# a REAL cluster, while every "instance" it provisions is a KWOK-simulated
+# Node (a `kwok://` providerID, no real EC2 launch, zero Spot/On-Demand
+# spend) -- directly satisfying both "if you have an EKS cluster, use it as
+# best you can" AND "try not to use too many AWS resources."
+#
+# VERIFIED LIVE (this exact manifest's shape, kubectl against
+# arn:aws:eks:us-east-1:726695008378:cluster/aaron-amartuvshin-expense-training):
+#   kubectl apply -f k8s/platform/expense-mixed.yaml
+#   kubectl get nodepool expense-mixed        # NODECLASS expense-mixed, READY True
+#   # scaled a 5-replica, 1-CPU-request `pause` Deployment with
+#   # nodeSelector: {workload: expense-api} against this NodePool:
+#   kubectl get nodeclaims                    # TYPE c-8x-amd64-linux, CAPACITY spot, READY True
+#   kubectl get pods -o wide                  # all 5 Running on the one Karpenter-provisioned node
+#   # scaled the Deployment back to 0 replicas; Karpenter's own disruption
+#   # controller reclaimed the now-empty NodeClaim (kwok/charts values'
+#   # consolidateAfter matched to this file's 600s) -- confirmed via
+#   # `kubectl get nodeclaims` returning to zero without any manual delete.
+# See expense-api/SRE-CAPSTONE.md's "Karpenter (real, KWOK-provider) spike"
+# section for the full timeline and the ECR/ko build trail.
+#
+# The one deviation from a true AWS-provider NodePool: `nodeClassRef` below
+# points at a `KWOKNodeClass` (`karpenter.kwok.sh`, this same directory's
+# companion CR, applied alongside this NodePool), not a real `EC2NodeClass`
+# (`karpenter.k8s.aws`) -- there is still no platform-owned EC2NodeClass in
+# this training account (AMI/subnet/SG selectors, instance profile), and
+# creating one from scratch (plus the Karpenter controller's own IRSA role
+# and SQS interruption queue) is out of scope for "minimise AWS resource
+# usage." A real EC2NodeClass is a drop-in swap for the KWOKNodeClass below
+# once the platform team provisions one.
+apiVersion: karpenter.kwok.sh/v1alpha1
+kind: KWOKNodeClass
+metadata:
+  name: expense-mixed
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: expense-mixed
+spec:
+  template:
+    metadata:
+      labels:
+        workload: expense-api
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          # Mixed pool: Karpenter prefers Spot when available and falls back
+          # to On-Demand on a Spot interruption signal. The PDB
+          # (k8s/expense-api/pdb.yaml) stops a wave of reclaims from taking
+          # the floor down all at once. (Live run above chose spot every
+          # time -- expected, since the kwok cloud provider's synthetic price
+          # table always prices spot below on-demand, same as reality.)
+          values: ["spot", "on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+      # nodeClassRef -> KWOKNodeClass today (see header); swap to
+      # {group: karpenter.k8s.aws, kind: EC2NodeClass} once a real
+      # EC2NodeClass exists in this account.
+      nodeClassRef:
+        group: karpenter.kwok.sh
+        kind: KWOKNodeClass
+        name: expense-mixed
+      expireAfter: 720h
+  disruption:
+    # Underutilised nodes are evicted; the workload re-packs onto fewer
+    # nodes -- EKS bills per node, not per pod, so bin-packing is real money
+    # even on a real EC2NodeClass. Karpenter's consolidation logic evaluates
+    # every PDB on the cluster before evicting, so k8s/expense-api/pdb.yaml's
+    # minAvailable: 2 is what keeps a WhenEmptyOrUnderutilized consolidation
+    # from ever taking expense-api below its HPA floor.
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    # 10 minutes mirrors the HPA's scaleDown.stabilizationWindowSeconds
+    # (k8s/expense-api/hpa.yaml) so both timers move in lockstep and the
+    # cluster doesn't churn nodes on a transient dip.
+    consolidateAfter: 600s
+  limits:
+    # Bounds the fleet so a runaway HPA (e.g. a metric-pipeline bug pinning
+    # expense_inflight_requests high) doesn't cost a fortune -- 200 vCPU /
+    # 400GiB caps this NodePool at roughly 25-50 of a mixed c/m instance
+    # fleet, an order of magnitude above this capstone's actual peak (~20
+    # expense-api replicas + ~20 expense-api-worker replicas at 250m/50m
+    # requests respectively). Harmless headroom on the KWOK provider (no
+    # real spend either way); load-bearing the day this swaps to a real
+    # EC2NodeClass.
+    cpu: "200"
+    memory: 400Gi
