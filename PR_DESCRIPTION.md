@@ -50,11 +50,19 @@ queue.
 `ReservoirSize: 10` (never `FixedRate: 0` on a real workload), `FixedRate: 0.05`.
 **Deployed live** (`expense-observability-dev-aaron`, us-east-1) — `CREATE_COMPLETE`.
 
-### Task 3 — ADOT dual-exporter
+### Task 3 — ADOT dual-exporter (`k8s/platform/otel-collector-values.yaml`)
 
-**Omitted this session** — the collector's second `awsxray` exporter block was
-not landed before session time ran out. The X-Ray rule (Task 2) and the existing
-Tempo pipeline (W5D5) each work independently.
+**Addressed on reviewer feedback.** The collector's `traces` pipeline now fans
+out to both `otlp` (Tempo) and a new `awsxray` exporter from one pipeline, not
+two — avoids the two sinks drifting out of sync (e.g. a processor added to only
+one). Credentials follow the same k3d-forced pattern as Task 1: no IRSA, trainee
+AWS key injected via a Secret onto the collector Deployment only. Applied via
+`helm upgrade`; a live round-trip (one test trace visible in both Tempo and
+X-Ray) could not be completed this pass — the upgrade itself repeatedly hit the
+same k3d instability as the environment limitation below (`context deadline
+exceeded` against the API server), not an error in the config. The release
+stayed at its prior, Tempo-only revision rather than landing half-applied.
+Verification commands are in the values file's header.
 
 ### Task 4 — SLO-derived HPA + PDB (`k8s/expense-api/`)
 
@@ -102,7 +110,8 @@ window, then restored.
 
 - [x] KEDA `ScaledObject` + `TriggerAuthentication` + synthetic worker Deployment
 - [x] X-Ray `SamplingRule`, non-zero `ReservoirSize`, deployed live
-- [ ] ADOT dual-exporter (Tempo + X-Ray) — **omitted this session** (see above)
+- [x] ADOT dual-exporter — config authored + applied; live round-trip
+      verification blocked by cluster instability (see above)
 - [x] SLO-derived HPA on a custom Prometheus metric (not CPU) + matching PDB
 - [x] Karpenter `NodePool`, Spot + On-Demand, **live** on the training EKS cluster
       via `karpenter-provider-kwok` (deviation documented)

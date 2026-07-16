@@ -208,11 +208,17 @@ EC2 spend. `nodeClassRef` points at a `KWOKNodeClass`, a drop-in swap for a real
 (`CAPACITY spot`), and Karpenter's own disruption controller reclaiming it after
 scale-to-zero with no manual delete. Full transcript in `SRE-CAPSTONE.md`.
 
-**Omission — ADOT dual-exporter (Tempo + X-Ray) not wired this session.** The
-X-Ray `SamplingRule` above and the existing Tempo OTLP pipeline (W5 D5) each
-exist independently; the collector configuration was not extended with the
-second `awsxray` exporter block before session time ran out. Noted per the
-instructor's "note any omissions" guidance rather than left unstated.
+**ADOT dual-exporter (Tempo + X-Ray) — addressed on reviewer feedback.**
+`k8s/platform/otel-collector-values.yaml` extends the collector's `traces`
+pipeline with a second `awsxray` exporter alongside the existing `otlp` (Tempo)
+one, so the same trace fans out to both sinks from one pipeline. Credentials
+follow the KEDA pattern (Task 1): no IRSA on k3d, trainee AWS key injected via a
+Secret onto the collector Deployment only. Applied via `helm upgrade`; a live
+round-trip (one test trace visible in both Tempo and X-Ray) could not be
+completed this pass — the upgrade itself repeatedly hit the same k3d API-server
+instability described below, not an error in the values file (the release stayed
+at its prior, Tempo-only revision rather than landing half-applied). See that
+file's header for the exact verification commands.
 
 **Environment limitation.** The local k3d cluster showed intermittent
 `NodeNotReady`/API-server TLS-handshake-timeout instability under this session's
