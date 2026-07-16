@@ -2,17 +2,47 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - ../../base
+  - 41-jwt-pubkey-configmap.yaml
+  # W6D5: SLO-derived HPA + PDB + KEDA worker scaling. dev-scoped (not
+  # base-scoped) because the KEDA ScaledObject/worker-deployment below
+  # hardcode the W6D5 CFN stack's dev SQS queue URL
+  # (expense-observability-dev-aaron) -- promoting to staging/prod needs a
+  # per-env queue + a restated inflight-target load test first (documented
+  # as future work in INFRA.md's "Deviations" section, not done here).
+  - ../../k8s/expense-api
 namespace: expense-dev
 images:
   - name: uptimecrew/expense-api
     newName: uptimecrew/expense-api
-    newTag: 0.1.0
+    newTag: 0.3.0-w6d5
 replicas:
   - name: expense-api
     count: 1
 patches:
+  # LOGGING_LEVEL_ROOT: W5D3. SPRING_PROFILES_ACTIVE / OTEL_*: W6D5 (see
+  # observability-patch.yaml's header for why dev flips smoke -> k8s and why
+  # no OTel Java agent init container is needed).
   - target: { kind: ConfigMap, name: expense-api-config }
     patch: |-
       - op: replace
         path: /data/LOGGING_LEVEL_ROOT
         value: DEBUG
+      - op: replace
+        path: /data/SPRING_PROFILES_ACTIVE
+        value: k8s
+      - op: replace
+        path: /data/OTEL_SDK_DISABLED
+        value: "false"
+      - op: add
+        path: /data/OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://otel-collector.monitoring.svc.cluster.local:4317
+      - op: add
+        path: /data/OTEL_EXPORTER_OTLP_PROTOCOL
+        value: grpc
+      - op: add
+        path: /data/OTEL_TRACES_SAMPLER
+        value: parentbased_traceidratio
+      - op: add
+        path: /data/OTEL_TRACES_SAMPLER_ARG
+        value: "0.2"
+  - path: observability-patch.yaml

@@ -1,0 +1,86 @@
+# k8s/expense-api/worker-deployment.yaml
+# TASK 1 supporting resource: the synthetic worker the KEDA ScaledObject in
+# this directory scales. The curriculum's reference substrate assumes an
+# `expense-api-worker` Deployment already exists (a real SQS consumer); this
+# capstone's app repo has no async worker process yet (ingest is synchronous
+# HTTP today -- see CostHeaderFilter), so this is a minimal, honest stand-in:
+# it long-polls the SAME expense-ingest-dev-aaron queue and deletes what it
+# reads, which is enough to (a) give KEDA something real to scale 0->N against
+# and (b) drain the W6D5 integration-spike's 4000 synthetic messages so the
+# queue doesn't grow unbounded across reruns. It is NOT the categorize-expense
+# business logic -- that stays in expense-api's synchronous path.
+#
+# amazon/aws-cli is reused (already an ECR-cached public image) rather than
+# adding a new image to build/push/scan for a demo consumer loop.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: expense-api-worker
+  labels:
+    app.kubernetes.io/name: expense-api-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: expense
+spec:
+  # KEDA owns replica count once the ScaledObject targets this Deployment
+  # (minReplicaCount: 0); this spec.replicas is only the pre-KEDA default and
+  # is not reconciled once the HPA KEDA creates (keda-hpa-expense-worker-scaledobject)
+  # takes ownership of the scale subresource.
+  replicas: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: expense-api-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: expense-api-worker
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: expense
+    spec:
+      # Read-only, least-privilege: the SAME trainee AWS key already used
+      # cluster-wide for this training account (no IRSA available on k3d --
+      # see expense-worker-scaledobject.yaml's header) is required here too,
+      # since the worker calls sqs:ReceiveMessage/DeleteMessage directly. This
+      # IS a workload pod carrying the credential, which is the one exception
+      # the curriculum's "never on the workload pod" rule is about the SCALER
+      # (KEDA), not the consumer that must actually read the queue to do its
+      # job -- a real EKS deployment would give this Deployment its own scoped
+      # IRSA role (queue-consumer only, no sampling-rule/GetQueueAttributes
+      # beyond its own read), never the operator's broader role.
+      containers:
+        - name: worker
+          image: amazon/aws-cli:2.17.62
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              echo "expense-api-worker: long-polling ${QUEUE_URL}"
+              while true; do
+                MSG=$(aws sqs receive-message --queue-url "$QUEUE_URL" --region "$AWS_REGION" \
+                  --max-number-of-messages 5 --wait-time-seconds 20 --output json || echo '{}')
+                COUNT=$(echo "$MSG" | grep -c '"MessageId"' || true)
+                if [ "$COUNT" -gt 0 ]; then
+                  echo "$MSG" | grep '"ReceiptHandle"' | sed -E 's/.*"ReceiptHandle": *"([^"]+)".*/\1/' | while read -r RH; do
+                    sleep 0.2   # synthetic processing latency
+                    aws sqs delete-message --queue-url "$QUEUE_URL" --region "$AWS_REGION" --receipt-handle "$RH" || true
+                  done
+                  echo "processed batch of $COUNT"
+                fi
+              done
+          env:
+            - name: QUEUE_URL
+              value: https://sqs.us-east-1.amazonaws.com/726695008378/expense-ingest-dev-aaron
+            - name: AWS_REGION
+              value: us-east-1
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: expense-worker-aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: expense-worker-aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 128Mi }

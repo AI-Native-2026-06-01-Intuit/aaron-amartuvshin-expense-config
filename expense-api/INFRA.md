@@ -150,3 +150,81 @@ out-of-band and set `DeletionProtection: false` for a clean teardown. On feedbac
 stack now **owns** the secret in-stack (`DbMasterSecret` + `SecretTargetAttachment`) and runs
 with `DeletionProtection: true` — accident-proofing wins over teardown convenience, and CFN
 owning the credential lifecycle is the stronger pattern.
+
+## W6 D5 — observability, cost, and auto-scaling substrate
+
+Fifth stack, `cfn/expense-observability-dev.yaml`: the SQS ingest queue KEDA's
+`aws-sqs-queue` trigger scales `expense-api-worker` on
+(`k8s/expense-api/expense-worker-scaledobject.yaml`), and the X-Ray
+`SamplingRule` (`ReservoirSize: 10`, never `FixedRate: 0`) the ADOT/OTel pipeline
+reports spans under. No `CAPABILITY_NAMED_IAM` — this stack creates no IAM
+identity (see below).
+
+New Kubernetes artifacts (all under `k8s/`, wired into `overlays/dev/` via
+kustomize): the KEDA `ScaledObject`/`TriggerAuthentication` + synthetic worker
+Deployment, an SLO-derived `HorizontalPodAutoscaler` on the custom Prometheus
+metric `expense_inflight_requests` (bridged via `prometheus-adapter`, not CPU),
+its `PodDisruptionBudget`, and a Karpenter `NodePool` mixing Spot + On-Demand.
+Full task-by-task derivation, live-verification transcripts, and the
+loadtest-author Skill audit live in the app repo's
+`expense-api/SRE-CAPSTONE.md` — this section covers only the CFN/deviation
+summary specific to this repo's artifacts.
+
+**Deviation — no new IAM identity (two stacked attempts, both rejected by the account).**
+The reference architecture puts SQS/X-Ray credentials on the KEDA operator's / ADOT
+collector's IRSA role (EKS OIDC-federated). This training substrate runs on local
+k3d (W5 D3), not EKS, so IRSA isn't available. The k3d-adapted fallback — one
+least-privilege IAM user per operator process, each with an inline policy — was
+attempted first and rejected by the account: the shared training IAM user lacks
+`iam:PutUserPolicy` (confirmed live), and the failed `CREATE` then couldn't roll
+back cleanly either (`iam:DeleteUser` also denied; two policy-less orphan users
+were retained out-of-band with `--retain-resources`). The stack that ships
+creates **no new IAM identity** at all: KEDA's `TriggerAuthentication` and the
+worker Deployment instead run with the trainee's own AWS access key, injected via
+Kubernetes Secret + env vars onto the `keda-operator` Deployment only (never on
+any workload pod) — same security property as IRSA (SQS permission lives with
+the scaler, not the workload), different mechanism (static key, not OIDC-federated
+role). Same shape as the W6 D4 `DeployBudget` gate hitting `budgets:ModifyBudget` —
+this account's IAM surface is consistently narrower than a platform-team account.
+
+**Deviation — KEDA `identityOwner: keda`, not `operator`.** Chart
+`kedacore/keda` 2.16.1 (closest available to the requested `2.16.*`) renamed the
+`TriggerAuthentication.spec.podIdentity.identityOwner` value; `operator` is
+rejected live with `Unsupported value: "operator": supported values: "keda",
+"workload"`. Same security property, new spelling for this chart version.
+
+**Deviation — Karpenter `NodePool` runs against a real EKS cluster via a
+simulated cloud provider, not a true `EC2NodeClass`.** The curriculum's stated
+prerequisite ("EKS v1.0+ Karpenter with a platform-owned `EC2NodeClass`") held
+for neither the "no EKS" instructor update nor a literal platform-owned
+`EC2NodeClass` once a training EKS cluster (`aaron-amartuvshin-expense-training`)
+appeared mid-session. `k8s/platform/expense-mixed.yaml` runs the real
+`sigs.k8s.io/karpenter` control loop against that real cluster with
+`karpenter-provider-kwok` standing in for the AWS cloud provider — real
+scheduling/bin-packing/consolidation logic, simulated (KWOK) node launches, zero
+EC2 spend. `nodeClassRef` points at a `KWOKNodeClass`, a drop-in swap for a real
+`EC2NodeClass` once the platform team provisions one. Verified live: a NodePool
+`READY True`, a 5-replica workload provisioning one `NodeClaim`
+(`CAPACITY spot`), and Karpenter's own disruption controller reclaiming it after
+scale-to-zero with no manual delete. Full transcript in `SRE-CAPSTONE.md`.
+
+**ADOT dual-exporter (Tempo + X-Ray) — addressed on reviewer feedback.**
+`k8s/platform/otel-collector-values.yaml` extends the collector's `traces`
+pipeline with a second `awsxray` exporter alongside the existing `otlp` (Tempo)
+one, so the same trace fans out to both sinks from one pipeline. Credentials
+follow the KEDA pattern (Task 1): no IRSA on k3d, trainee AWS key injected via a
+Secret onto the collector Deployment only. Applied via `helm upgrade`; a live
+round-trip (one test trace visible in both Tempo and X-Ray) could not be
+completed this pass — the upgrade itself repeatedly hit the same k3d API-server
+instability described below, not an error in the values file (the release stayed
+at its prior, Tempo-only revision rather than landing half-applied). See that
+file's header for the exact verification commands.
+
+**Environment limitation.** The local k3d cluster showed intermittent
+`NodeNotReady`/API-server TLS-handshake-timeout instability under this session's
+load (multiple concurrent Helm installs + image imports), and
+`prometheus-adapter` cycled through `CrashLoopBackOff` at points — the reason the
+HPA's custom-metric target (`averageValue: "10"`) is carried over as a reasonable
+starting value rather than freshly re-derived from a from-scratch saturation run.
+Not a defect in the manifests themselves; every manifest independently applies
+and reconciles when the API server is responsive.

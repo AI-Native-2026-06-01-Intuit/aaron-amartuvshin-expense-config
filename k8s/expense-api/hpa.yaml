@@ -1,0 +1,76 @@
+# k8s/expense-api/hpa.yaml
+# TASK 2: SLO-derived HPA on the W6D5 custom Prometheus metric
+# `expense_inflight_requests` (per-replica in-flight request gauge, wired by
+# the app repo's InflightRequestsFilter -- see that class's javadoc for the
+# full derivation). Bridged from Prometheus into the custom.metrics.k8s.io
+# API by prometheus-adapter (helm-installed alongside kube-prometheus-stack --
+# `helm upgrade --install prometheus-adapter prometheus-community/prometheus-adapter
+# -n monitoring` with a custom rule matching `expense_inflight_requests`; see
+# INFRA.md's "SLO-derived HPA" section for the full adapter rule + why a
+# `type: Pods` HPA metric reads custom.metrics.k8s.io, not
+# external.metrics.k8s.io -- external is for metrics with no natural
+# Kubernetes object association, which doesn't apply here since this metric
+# already carries a `pod` label from Prometheus's pod-scrape target).
+#
+# WHY NOT targetCPUUtilizationPercentage: 80 (Section 9 sticking point #1):
+# expense-api spends most of its wall-clock time blocked on an upstream call
+# (LLM proxy / Mongo) inside CostHeaderFilter's synchronous request path --
+# CPU stays low even while 30 requests queue behind a slow dependency. A
+# CPU-only HPA is blind to exactly the condition that breaches the W5D5 p99
+# SLO. `expense_inflight_requests` rises the instant requests start queueing,
+# independent of CPU.
+#
+# REPLACES the pre-GitOps, out-of-band `expense-api` HPA (CPU 70%, min 2/max 5)
+# that predates the W6D2 cutover and was never brought under kustomize
+# management -- removed via `kubectl delete hpa expense-api -n expense-dev`
+# (INFRA.md's "Deviations" section documents the one-time cleanup so Argo CD's
+# selfHeal never fights two HPAs over the same Deployment's replica count).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: expense-api-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: expense-api
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    # Pods metric source: prometheus-adapter's rule (INFRA.md) exposes
+    # expense_inflight_requests under custom.metrics.k8s.io/v1beta1, keyed per
+    # pod by the `<<.GroupBy>>` label match on `kubernetes_pod_name`; the HPA
+    # controller averages it across the Deployment's pods itself (that's what
+    # `type: AverageValue` on a Pods metric means -- no adapter-side averaging
+    # needed). Target 10 comes from a single-replica saturation load test:
+    # ramp one pod until p99 reaches the 600ms SLO; that per-pod inflight
+    # count IS the SLO-derived target (expense-api/SRE-CAPSTONE.md).
+    - type: Pods
+      pods:
+        metric:
+          name: expense_inflight_requests
+        target:
+          type: AverageValue
+          averageValue: "10"
+  behavior:
+    scaleDown:
+      # 10-minute stabilization window so a bursty dip doesn't cost a
+      # cold-start cycle when load returns (W5D3 callback: the 5-minute
+      # default is too short for this bursty-but-upstream-bound profile).
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+      # selectPolicy: Max means the more aggressive of the two scale-up
+      # policies wins on a spike (k6 ramp / integration spike).
+      selectPolicy: Max

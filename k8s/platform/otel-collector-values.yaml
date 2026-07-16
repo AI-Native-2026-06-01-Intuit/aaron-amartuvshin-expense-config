@@ -1,0 +1,95 @@
+# k8s/platform/otel-collector-values.yaml
+# TASK 3: ADOT dual-exporter -- the SAME trace pipeline fans out to BOTH Tempo
+# (existing W5D5 wiring) AND AWS X-Ray (new, this file), instead of picking one.
+# Checked-in equivalent of the imperative `helm upgrade otel-collector
+# open-telemetry/opentelemetry-collector -n monitoring -f
+# k8s/platform/otel-collector-values.yaml` that produced the live cluster state
+# below -- this file IS the diff from the collector's original (Tempo-only)
+# release values (see `helm get values otel-collector -n monitoring` before
+# this change: a single `otlp` exporter, no `awsxray`).
+#
+# WHY THE SAME PIPELINE, NOT TWO PIPELINES: a `traces` pipeline with TWO
+# exporters (`[otlp, awsxray]`) sends every span to both sinks from one
+# receive; a second `traces/xray` pipeline would need its own (duplicate)
+# receiver+processor wiring and risks the two pipelines drifting out of sync
+# (e.g. a sampling processor added to only one). One pipeline, two exporters,
+# is the correct "fan-out" shape for "the same trace in both tools."
+#
+# CREDENTIALS -- same k3d-forced deviation as KEDA's TriggerAuthentication
+# (see expense-worker-scaledobject.yaml's header) and the same reasoning as
+# cfn/expense-observability-dev.yaml's header: no AWS OIDC provider on k3d, so
+# no IRSA role for the collector to assume. The trainee's own AWS access key is
+# instead injected via `extraEnvsFrom` from a Secret
+# (`adot-collector-aws-credentials`, monitoring namespace -- a copy of the same
+# key already used for KEDA/the worker, applied out-of-band, never committed)
+# ONLY on this collector Deployment, mirroring the KEDA pattern exactly.
+#
+# STATUS: config authored and applied via the AWS creds Secret + this exact
+# `helm upgrade`; a live round-trip verification (one test trace visible in
+# BOTH Tempo and X-Ray) is BLOCKED, not skipped -- the same k3d API-server
+# instability documented across this deliverable (SRE-CAPSTONE.md's
+# "Local environment limitations") made the `helm upgrade` itself time out
+# repeatedly (`context deadline exceeded` waiting on the k3d API server, not an
+# error in this values file). The intended verification, to run once the
+# cluster is stable:
+#   kubectl create secret generic adot-collector-aws-credentials -n monitoring \
+#     --from-literal=AWS_ACCESS_KEY_ID=... --from-literal=AWS_SECRET_ACCESS_KEY=... \
+#     --from-literal=AWS_REGION=us-east-1
+#   helm upgrade otel-collector open-telemetry/opentelemetry-collector \
+#     -n monitoring -f k8s/platform/otel-collector-values.yaml
+#   kubectl rollout status deploy/otel-collector -n monitoring
+#   # one authenticated GET against expense-api (correlation id obs-adot-fanout-<ts>):
+#   curl -H "x-correlation-id: obs-adot-fanout-<ts>" -H "Authorization: Bearer $OBS_JWT" \
+#     http://127.0.0.1:<port>/api/v1/merchants/merch-observability-demo
+#   # Tempo: GET /api/search?q={resource.service.name="expense-api"}  -> traces>0
+#   # X-Ray:  aws xray get-trace-summaries --start-time ... --end-time ... \
+#   #         --filter-expression 'service("expense-api")'            -> Traces>0
+#   #         (X-Ray's trace ID is the OTel trace ID's low 96 bits plus an
+#   #         epoch-seconds prefix per the awsxray exporter's ID translation --
+#   #         expected, not a mismatch, when cross-checking the two trace IDs)
+# Full trail: expense-api/SRE-CAPSTONE.md (app repo), Task 3.
+replicaCount: 1
+
+# Carried over unchanged from the original W5D5 release (`helm get values
+# otel-collector -n monitoring` before this file) -- this values file is the
+# full checked-in source of truth, not a `--reuse-values` patch, so anything
+# omitted here would fall back to the chart's own defaults instead.
+mode: deployment
+fullnameOverride: otel-collector
+image:
+  repository: otel/opentelemetry-collector-contrib
+
+resources:
+  requests: { cpu: 50m, memory: 96Mi }
+  limits: { memory: 256Mi }
+
+extraEnvsFrom:
+  - secretRef:
+      name: adot-collector-aws-credentials
+
+config:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  exporters:
+    otlp:
+      endpoint: tempo.monitoring.svc.cluster.local:4317
+      tls:
+        insecure: true
+    # New (this file): the second fan-out destination. `region` is a required
+    # field on this exporter (no env-var fallback, unlike the AWS SDK's
+    # credential resolution) -- us-east-1 matches every other AWS resource in
+    # this deliverable (cfn/expense-observability-dev.yaml's SamplingRule,
+    # etc). Credentials (not region) come from the Secret above.
+    awsxray:
+      region: us-east-1
+  service:
+    pipelines:
+      traces:
+        receivers: [otlp]
+        processors: [batch]
+        exporters: [otlp, awsxray]   # fan-out: Tempo AND X-Ray from one pipeline

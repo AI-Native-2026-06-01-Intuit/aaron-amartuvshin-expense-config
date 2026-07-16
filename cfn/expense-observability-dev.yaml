@@ -1,0 +1,121 @@
+# cfn/expense-observability-dev.yaml
+# W6 D5 observability + event substrate: the AWS::XRay::SamplingRule the ADOT
+# collector's awsxray exporter reports against, and the SQS queue the KEDA
+# ScaledObject scales the synthetic worker on.
+#
+# WHY NO IRSA ROLE / NO NEW IAM IDENTITY HERE (two stacked deviations):
+#   1. The reference architecture puts the SQS + X-Ray credentials on the KEDA
+#      operator's / ADOT collector's IRSA role (EKS OIDC-federated, zero
+#      long-lived keys). This training substrate runs on a local k3d cluster
+#      (W5 D3), not EKS, so there is no AWS OIDC provider to federate against
+#      -- IRSA is not something k3d can do.
+#   2. The k3d-adapted fallback -- one least-privilege IAM user per operator
+#      process (`expense-observability-aaron` for KEDA+ADOT,
+#      `expense-worker-sqs-consumer-aaron` for the synthetic worker), each with
+#      an inline least-privilege policy -- was attempted here FIRST and
+#      REJECTED BY THE ACCOUNT: the shared training IAM user lacks
+#      `iam:PutUserPolicy` (`AccessDenied` on both `AWS::IAM::User` resources'
+#      inline `Policies:` block, confirmed live against 726695008378). The
+#      failed CREATE then hit a second wall on rollback -- `iam:DeleteUser` is
+#      ALSO denied, so CloudFormation could not clean up the two bare
+#      (policy-less, permission-less) users it had already created before the
+#      inline-policy call failed; they were retained out-of-band
+#      (`--retain-resources`) and are harmless orphans with zero attached
+#      permissions. Same shape as the W6 D4 `DeployBudget` gate
+#      (`budgets:ModifyBudget` denied) -- this account's IAM surface is
+#      narrower than a real platform-team account, and CFN owning a new IAM
+#      identity is consistently the wall.
+#
+# So this stack creates NO new IAM identity. KEDA's TriggerAuthentication and
+# the ADOT collector's awsxray exporter instead run with the SAME trainee IAM
+# user already used for every `aws cloudformation` call in this repo
+# (`aaron_amartuvshin@intuit.com`) -- its access key lives OUT OF BAND in two
+# K8s Secrets (`expense-dev/expense-keda-aws-creds`,
+# `platform-svc/adot-collector-aws-creds`; see k8s/expense-api/expense-worker-scaledobject.yaml
+# and k8s/platform/adot-collector.yaml), never committed, never on the two
+# workload Deployments (expense-api, expense-api-worker). That preserves the
+# curriculum's actual requirement ("never on every workload pod") even though
+# neither the identity mechanism (static key, not IRSA) nor its scope
+# (this account has no narrower identity available) matches the reference
+# shape. See expense-api/SRE-CAPSTONE.md for the full trail.
+#
+# SHARED-ACCOUNT NOTE: account 726695008378 is shared across team67, so every
+# named resource carries the `-aaron` trainee suffix (INFRA.md).
+#
+# Deploy with the ChangeSet flow (same as W6 D3/D4). No CAPABILITY_NAMED_IAM --
+# this stack creates no IAM resources:
+#   aws cloudformation create-change-set \
+#     --stack-name expense-observability-dev-aaron \
+#     --change-set-name initial --change-set-type CREATE \
+#     --template-body file://cfn/expense-observability-dev.yaml \
+#     --parameters ParameterKey=EnvName,ParameterValue=dev \
+#     --tags Key=trainee,Value=aaron-amartuvshin Key=team,Value=team67 Key=environment,Value=training \
+#     --region us-east-1
+#   aws cloudformation describe-change-set ...   # paste the resource diff into the PR body
+#   aws cloudformation execute-change-set ...
+#   aws cloudformation wait stack-create-complete ...
+AWSTemplateFormatVersion: "2010-09-09"
+Description: expense observability + event substrate -- X-Ray sampling rule + ingest queue (aaron).
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment.
+
+Resources:
+  # --- KEDA's aws-sqs-queue trigger reads this queue's ApproximateNumberOfMessages
+  # via GetQueueAttributes (queueLength: "10" in the ScaledObject). The W6 D5
+  # integration spike posts 4000 synthetic events here.
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: expense-ingest-dev-aaron
+      # 5 minutes: long enough for the synthetic worker's sleep-based "processing"
+      # loop to finish one batch before SQS makes the message visible again.
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 345600   # 4 days; this is a demo queue, not a durable log
+      SqsManagedSseEnabled: true
+      Tags:
+        - {Key: service, Value: expense}
+        - {Key: env,     Value: !Ref EnvName}
+        - {Key: tenant,  Value: shared}
+        - {Key: feature, Value: categorize-expense}
+
+  # --- X-Ray sampling rule the ADOT collector's awsxray exporter reports spans
+  # under. ReservoirSize: 10 floors the rate at 10 traces/sec always-captured
+  # (so a quiet period still captures the first traces of an emerging incident);
+  # FixedRate: 0.05 samples 5% of everything above the floor. NEVER FixedRate: 0
+  # on a real workload -- that samples nothing once traffic clears the reservoir.
+  ExpenseSamplingRule:
+    Type: AWS::XRay::SamplingRule
+    Properties:
+      SamplingRule:
+        RuleName: expense-api-default-aaron
+        Priority: 1000
+        ReservoirSize: 10
+        FixedRate: 0.05
+        ServiceName: expense-api
+        ServiceType: "*"
+        Host: "*"
+        HTTPMethod: "*"
+        URLPath: "*"
+        ResourceARN: "*"
+        Version: 1
+      Tags:
+        - {Key: service, Value: expense}
+        - {Key: env,     Value: !Ref EnvName}
+        - {Key: tenant,  Value: shared}
+        - {Key: feature, Value: categorize-expense}
+
+Outputs:
+  IngestQueueUrl:
+    Value: !Ref IngestQueue
+    Export: {Name: !Sub "${AWS::StackName}-IngestQueueUrl"}
+  IngestQueueArn:
+    Value: !GetAtt IngestQueue.Arn
+    Export: {Name: !Sub "${AWS::StackName}-IngestQueueArn"}
+  SamplingRuleArn:
+    Value: !GetAtt ExpenseSamplingRule.RuleARN
+    Export: {Name: !Sub "${AWS::StackName}-SamplingRuleArn"}

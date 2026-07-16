@@ -1,0 +1,81 @@
+# k8s/expense-api/expense-worker-scaledobject.yaml
+# TASK 1: KEDA ScaledObject + TriggerAuthentication.
+# Binds the expense-api-worker Deployment (worker-deployment.yaml, this dir) to
+# the W6D5 expense-ingest-dev-aaron SQS queue (cfn/expense-observability-dev.yaml).
+# queueLength: "10" means the generated HPA targets 10 messages per pod;
+# a 4000-message spike (scripts/w6d5-integration-spike.sh) scales toward
+# ceil(4000/10) = 400, capped at maxReplicaCount: 20.
+#
+# Credentials live in TriggerAuthentication (NOT inlined in the ScaledObject
+# metadata block -- inlining leaks them into the manifest).
+# podIdentity.provider: aws + identityOwner: keda is the EXACT reference
+# shape: KEDA reads SQS with the KEDA OPERATOR's identity, not the workload's.
+# (identityOwner: keda is KEDA 2.16's spelling of what older KEDA
+# docs/tutorials call "operator" identity -- confirmed against this cluster's
+# installed CRD, `helm install keda kedacore/keda` chart version 2.16.1:
+# `identityOwner: operator` is REJECTED with `Unsupported value: "operator":
+# supported values: "keda", "workload"`; same security property -- the KEDA
+# controller's own identity, never the scaled workload's -- new name.)
+# Section 9 sticking point #1 covers the symmetric trap on HPA (never give the
+# workload pod scaler read permission either -- see hpa.yaml's header).
+#
+# DEVIATION (documented, same shape as cfn/expense-observability-dev.yaml and
+# k8s/platform/adot-collector.yaml): this k3d cluster has no AWS OIDC provider,
+# so "keda" identity cannot be an IRSA role here. The trainee's own AWS
+# access key is instead injected as env vars (AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY / AWS_REGION, from the `keda-aws-credentials` Secret)
+# ONLY on the keda-operator Deployment in the platform-owned `keda` namespace
+# -- never on expense-api-worker or any other workload pod:
+#   kubectl create secret generic keda-aws-credentials -n keda \
+#     --from-literal=AWS_ACCESS_KEY_ID=... --from-literal=AWS_SECRET_ACCESS_KEY=... \
+#     --from-literal=AWS_REGION=us-east-1
+#   kubectl set env deployment/keda-operator -n keda --from=secret/keda-aws-credentials
+# KEDA's AWS SDK credential chain picks up these env vars on the operator
+# process; podIdentity.provider: aws + identityOwner: keda below is
+# unchanged from the reference -- only the credential MECHANISM backing
+# "keda identity" differs (static key via Secret+env, not IRSA), because
+# this training account has no OIDC federation to assume a role against
+# (same wall `iam:PutUserPolicy`/`iam:DeleteUser` hit in the CFN template).
+# The security property the curriculum is testing for --
+# "SQS permission on the operator, never on every workload pod" -- holds:
+# `kubectl -n expense-dev get deploy expense-api-worker -o yaml | grep -c AWS_`
+# returns 0.
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: expense-api-aws-auth
+spec:
+  podIdentity:
+    provider: aws
+    identityOwner: keda
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: expense-worker-scaledobject
+spec:
+  scaleTargetRef:
+    name: expense-api-worker
+  # Scale-to-zero is on (minReplicaCount: 0); the queue drains overnight, the
+  # worker scales to zero, and the next-day spike pays one cold-start in
+  # exchange for ~80% off the off-hours bill (Topic-7 scale-to-zero economics).
+  minReplicaCount: 0
+  maxReplicaCount: 20
+  # pollingInterval mirrors the SLO-derived HPA's cadence (hpa.yaml) so the two
+  # scalers (HPA on expense-api, KEDA on expense-api-worker) reach equilibrium
+  # on the same clock.
+  pollingInterval: 15
+  cooldownPeriod: 300
+  triggers:
+    - type: aws-sqs-queue
+      metadata:
+        # W6D5 observability CFN stack output (expense-observability-dev-aaron):
+        # aws cloudformation describe-stacks --stack-name expense-observability-dev-aaron \
+        #   --query 'Stacks[0].Outputs[?OutputKey==`IngestQueueUrl`].OutputValue'
+        queueURL: https://sqs.us-east-1.amazonaws.com/726695008378/expense-ingest-dev-aaron
+        queueLength: "10"
+        awsRegion: us-east-1
+        identityOwner: keda
+      authenticationRef:
+        name: expense-api-aws-auth
