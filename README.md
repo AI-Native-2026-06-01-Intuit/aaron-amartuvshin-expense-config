@@ -1,4 +1,4 @@
-# aaron-amartuvshin-expense-config
+# ladakhanar-expense-config
 
 GitOps config repo for `expense-api` (W6 D2). Argo CD (in the k3d cluster) watches
 `main` and pulls desired state in — the cluster no longer accepts inbound `kubectl apply`.
